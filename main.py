@@ -1,12 +1,4 @@
-import os
-import re
-import sqlite3
-import logging
-import random
-import requests
-import pandas as pd
-import nltk
-import yfinance as yf
+import os, re, sqlite3, logging, random, requests, pandas as pd, nltk, yfinance as yf, pytz
 from time import sleep
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
@@ -20,6 +12,8 @@ from keybert import KeyBERT
 from difflib import get_close_matches
 from googlesearch import search
 import numpy as np
+import json
+from word_analysis_framework import NewsAnalysisFramework
 
 # Configuration
 CONFIG = {
@@ -28,71 +22,177 @@ CONFIG = {
     'CSV_OUTPUT': "finviz_first5.csv",
     'MAX_TICKERS': 5,
     'DAYS_BACK': 7,
-    'USER_AGENT': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    'USER_AGENT': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-# Comprehensive sentiment keywords
-SENTIMENT_KEYWORDS = {
-    # Positive financial terms
-    "merger": "positive", "acquisition": "positive", "buyout": "positive", "takeover": "positive",
-    "stimulus": "positive", "monetary stimulus": "positive", "fiscal stimulus": "positive",
-    "rate cuts": "positive", "big cuts": "positive", "rate reduction": "positive", "cut rates": "positive",
-    "pboc": "positive", "fed support": "positive", "central bank support": "positive",
-    "liquidity": "positive", "liquidity injection": "positive", "cash injection": "positive",
-    "qe": "positive", "quantitative easing": "positive", "asset purchases": "positive",
-    "dovish": "positive", "accommodative": "positive", "loose monetary": "positive",
-    "earnings beat": "positive", "beat expectations": "positive", "strong earnings": "positive",
-    "revenue growth": "positive", "profit growth": "positive", "margin expansion": "positive",
-    "dividend increase": "positive", "dividend hike": "positive", "share buyback": "positive",
-    "stock split": "positive", "bullish": "positive", "rally": "positive", "surge": "positive",
-    "breakthrough": "positive", "innovation": "positive", "patent": "positive", "approval": "positive",
-    "expansion": "positive", "growth": "positive", "recovery": "positive", "rebound": "positive",
-    "upgrade": "positive", "outperform": "positive", "buy rating": "positive", "strong buy": "positive",
-    "partnership": "positive", "alliance": "positive", "joint venture": "positive",
-    "contract win": "positive", "deal secured": "positive", "order backlog": "positive",
-    "market share": "positive", "competitive advantage": "positive", "moat": "positive",
-    "free cash flow": "positive", "cash generation": "positive", "debt reduction": "positive",
-    
-    # Negative financial terms
-    "cpi": "negative", "inflation": "negative", "high inflation": "negative", "rising prices": "negative",
-    "qt": "negative", "quantitative tightening": "negative", "qe taper": "negative", "tapering": "negative",
-    "tightening": "negative", "hawkish": "negative", "restrictive policy": "negative",
-    "rate hikes": "negative", "interest rate increase": "negative", "higher rates": "negative",
-    "recession": "negative", "downturn": "negative", "contraction": "negative", "slowdown": "negative",
-    "bearish": "negative", "decline": "negative", "crash": "negative", "plunge": "negative",
-    "earnings miss": "negative", "miss expectations": "negative", "weak earnings": "negative",
-    "revenue decline": "negative", "profit warning": "negative", "margin compression": "negative",
-    "dividend cut": "negative", "dividend suspension": "negative", "share dilution": "negative",
-    "bankruptcy": "negative", "insolvency": "negative", "default": "negative", "restructuring": "negative",
-    "layoffs": "negative", "job cuts": "negative", "workforce reduction": "negative",
-    "downgrade": "negative", "underperform": "negative", "sell rating": "negative", "avoid": "negative",
-    "investigation": "negative", "lawsuit": "negative", "regulatory action": "negative", "fine": "negative",
-    "supply chain": "negative", "shortage": "negative", "disruption": "negative", "delay": "negative",
-    "competition": "negative", "market pressure": "negative", "pricing pressure": "negative",
-    "debt burden": "negative", "cash burn": "negative", "liquidity concerns": "negative",
-    "guidance cut": "negative", "outlook reduced": "negative", "forecast lowered": "negative",
-    "volatility": "negative", "uncertainty": "negative", "risk": "negative", "concern": "negative",
-    "sell-off": "negative", "correction": "negative", "bear market": "negative", "loss": "negative",
-    "weak demand": "negative", "declining sales": "negative", "market share loss": "negative",
-    
-    # Sector-specific terms
-    "gold demand": "positive", "gold shortage": "positive", "safe haven": "positive",
-    "mining output": "positive", "ore grade": "positive", "resource expansion": "positive",
-    "commodity prices": "positive", "precious metals": "positive", "inflation hedge": "positive",
-    "geopolitical tension": "positive", "currency debasement": "positive", "dollar weakness": "positive",
-    "mining costs": "negative", "environmental concerns": "negative", "permit delays": "negative",
-    "labor strikes": "negative", "operational issues": "negative", "production cuts": "negative",
-    
-    # Market sentiment terms
-    "optimism": "positive", "confidence": "positive", "momentum": "positive", "strength": "positive",
-    "resilience": "positive", "robust": "positive", "solid": "positive", "stable": "positive",
-    "pessimism": "negative", "fear": "negative", "panic": "negative", "weakness": "negative",
-    "fragile": "negative", "unstable": "negative", "vulnerable": "negative", "risk-off": "negative"
-}
+# Suppress yfinance warnings
+yf_logger = logging.getLogger("yfinance")
+yf_logger.setLevel(logging.ERROR)
 
-# Global setup
+# Load sentiment keywords from CSV
+sentiment_df = pd.read_csv("sentiment_keywords.csv")
+SENTIMENT_KEYWORDS = dict(zip(sentiment_df["keyword"], sentiment_df["sentiment"]))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+class SimplifiedPriceAnalyzer:
+    def __init__(self):
+        self.price_cache = {}
+        self.eastern_tz = pytz.timezone('US/Eastern')
+    
+    def get_historical_stock_price_simplified(self, ticker, article_datetime):
+        try:
+            # Ensure timezone
+            if article_datetime.tzinfo is None:
+                article_datetime = self.eastern_tz.localize(article_datetime)
+            else:
+                article_datetime = article_datetime.astimezone(self.eastern_tz)
+            
+            # Check cache
+            cache_key = f"{ticker}_{article_datetime.strftime('%Y%m%d_%H%M')}"
+            if cache_key in self.price_cache:
+                return self.price_cache[cache_key]
+            
+            # Fetch data
+            start_date = (article_datetime - timedelta(days=5)).date()
+            end_date = (article_datetime + timedelta(days=10)).date()
+            
+            stock = yf.Ticker(ticker)
+            hist_data = stock.history(start=start_date, end=end_date, interval='1d')
+            if hist_data.empty:
+                return None
+            
+            # Fix timezone
+            if hist_data.index.tz is None:
+                hist_data.index = hist_data.index.tz_localize('UTC').tz_convert(self.eastern_tz)
+            else:
+                hist_data.index = hist_data.index.tz_convert(self.eastern_tz)
+            
+            # Get baseline price
+            baseline_price = self._get_baseline_price(hist_data, article_datetime)
+            if baseline_price is None:
+                return None
+            
+            # Calculate intervals
+            intervals = {
+                '1h': timedelta(hours=1),
+                '4h': timedelta(hours=4),
+                'eod': self._get_end_of_day_delta(article_datetime),
+                'eow': self._get_end_of_week_delta(article_datetime)
+            }
+            
+            result = {
+                'ticker': ticker,
+                'article_datetime': article_datetime,
+                'baseline_price': round(baseline_price, 2),
+                'data_interval': '1d',
+                'data_points': len(hist_data)
+            }
+            
+            # Process each interval
+            for interval_name, delta in intervals.items():
+                target_time = article_datetime + delta
+                
+                if target_time > datetime.now(self.eastern_tz):
+                    result[f'price_{interval_name}'] = None
+                    result[f'pct_change_{interval_name}'] = None
+                    result[f'direction_{interval_name}'] = "Future"
+                    continue
+                
+                target_price = self._get_price_at_time(hist_data, target_time)
+                pct_change = self._calculate_pct_change(baseline_price, target_price)
+                
+                result[f'price_{interval_name}'] = round(target_price, 2) if target_price is not None else None
+                result[f'pct_change_{interval_name}'] = round(pct_change, 2) if pct_change is not None else None
+                result[f'direction_{interval_name}'] = self._get_direction_label(pct_change)
+            
+            self.price_cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            logger.error(f"Price analysis failed for {ticker}: {e}")
+            return None
+    
+    def _get_baseline_price(self, hist_data, article_datetime):
+        try:
+            if hist_data.empty:
+                return None
+            
+            market_close_time = article_datetime.replace(hour=16, minute=0, second=0, microsecond=0)
+            
+            if article_datetime.time() > market_close_time.time():
+                next_day = article_datetime + timedelta(days=1)
+                target_date = next_day.date()
+            else:
+                target_date = article_datetime.date()
+            
+            available_dates = [d.date() for d in hist_data.index]
+            target_dates = pd.bdate_range(start=target_date, periods=5).date
+            
+            for date in target_dates:
+                if date in available_dates:
+                    return float(hist_data.loc[hist_data.index.date == date, 'Open'].iloc[0])
+            
+            return float(hist_data['Open'].iloc[0])
+            
+        except Exception as e:
+            logger.error(f"Error getting baseline price: {e}")
+            return None
+    
+    def _get_price_at_time(self, hist_data, target_datetime):
+        try:
+            if hist_data.empty:
+                return None
+            
+            target_date = target_datetime.date()
+            available_dates = [d.date() for d in hist_data.index]
+            
+            future_dates = [d for d in available_dates if d >= target_date]
+            if future_dates:
+                closest_date = min(future_dates)
+                return float(hist_data.loc[hist_data.index.date == closest_date, 'Close'].iloc[0])
+            
+            return float(hist_data['Close'].iloc[-1])
+            
+        except Exception as e:
+            logger.error(f"Error getting price at time: {e}")
+            return None
+    
+    def _calculate_pct_change(self, baseline_price, target_price):
+        if baseline_price is None or target_price is None:
+            return None
+        try:
+            return ((target_price - baseline_price) / baseline_price) * 100
+        except (ZeroDivisionError, TypeError):
+            return None
+    
+    def _get_direction_label(self, pct_change):
+        if pct_change is None:
+            return "No Data"
+        elif pct_change > 0:
+            return "Positive ↑"
+        elif pct_change < 0:
+            return "Negative ↓"
+        else:
+            return "Neutral →"
+    
+    def _get_end_of_day_delta(self, article_datetime):
+        eod_time = article_datetime.replace(hour=16, minute=0, second=0, microsecond=0)
+        if article_datetime.hour >= 16:
+            eod_time += timedelta(days=1)
+        return eod_time - article_datetime
+    
+    def _get_end_of_week_delta(self, article_datetime):
+        days_until_friday = (4 - article_datetime.weekday()) % 7
+        if days_until_friday == 0:
+            if article_datetime.hour >= 16:
+                days_until_friday = 7
+        elif days_until_friday == 0:
+            days_until_friday = 0
+        
+        eow_time = article_datetime + timedelta(days=days_until_friday)
+        eow_time = eow_time.replace(hour=16, minute=0, second=0, microsecond=0)
+        return eow_time - article_datetime
 
 class NewsProcessor:
     def __init__(self):
@@ -100,13 +200,56 @@ class NewsProcessor:
         self.valid_tickers = self._load_tickers()
         self.stopwords = self._setup_nltk()
         self.lemmatizer = WordNetLemmatizer()
-        self.kw_model = KeyBERT(model='all-MiniLM-L6-v2')
-        self.headers = {"User-Agent": CONFIG['USER_AGENT'], "Accept-Language": "en-US,en;q=0.9"}
-        self.price_cache = {}  # Cache for price data to avoid repeated API calls
+        try:
+            self.kw_model = KeyBERT(model='all-MiniLM-L6-v2')
+        except:
+            self.kw_model = None
+            logger.warning("KeyBERT model not available")
+        self.headers = {"User-Agent": CONFIG['USER_AGENT']}
+        self.price_analyzer = SimplifiedPriceAnalyzer()
+        self.word_analyzer = NewsAnalysisFramework()
+        self.sentiment_weights = self.load_sentiment_weights()
+    
+    def load_sentiment_weights(self):
+        """Load dynamic sentiment weights from analysis"""
+        try:
+            with open("word_analysis_results.json", 'r') as f:
+                results = json.load(f)
+                return results.get('sentiment_weights', {})
+        except FileNotFoundError:
+            logger.warning("No word analysis results found, using basic sentiment")
+            return {}
+    
+    def calculate_dynamic_sentiment(self, text):
+        """Calculate sentiment using learned weights"""
+        if not self.sentiment_weights:
+            return 0
+        
+        words = text.split()
+        sentiment_score = 0
+        total_weight = 0
+        
+        for word in words:
+            if word in self.sentiment_weights:
+                weight = self.sentiment_weights[word]['weight']
+                confidence = self.sentiment_weights[word]['confidence']
+                sentiment_score += weight * confidence
+                total_weight += confidence
+        
+        # Check bigrams
+        for i in range(len(words) - 1):
+            bigram = f"{words[i]} {words[i+1]}"
+            if bigram in self.sentiment_weights:
+                weight = self.sentiment_weights[bigram]['weight']
+                confidence = self.sentiment_weights[bigram]['confidence']
+                sentiment_score += weight * confidence * 1.5  # Boost bigrams
+                total_weight += confidence
+        
+        return sentiment_score / (total_weight + 1e-6)  # Avoid division by zero
     
     def _create_session(self):
         session = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[403, 500, 502, 503, 504])
+        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
         session.mount("http://", HTTPAdapter(max_retries=retry))
         session.mount("https://", HTTPAdapter(max_retries=retry))
         return session
@@ -115,7 +258,7 @@ class NewsProcessor:
         try:
             df = pd.read_csv(CONFIG['CSV_INPUT'])
             tickers = set(df['Ticker'].dropna().str.upper()) if 'Ticker' in df.columns else set()
-            logger.info(f"Loaded {len(tickers)} valid tickers")
+            logger.info(f"Loaded {len(tickers)} tickers")
             return tickers
         except Exception as e:
             logger.error(f"Failed to load tickers: {e}")
@@ -129,243 +272,110 @@ class NewsProcessor:
                 nltk.download(name, quiet=True)
         return set(stopwords.words("english"))
     
-    def get_stock_price_data(self, ticker, article_datetime):
-        """Fetch historical stock price data around article publication time"""
-        try:
-            # Create cache key
-            cache_key = f"{ticker}_{article_datetime.date()}"
-            if cache_key in self.price_cache:
-                return self.price_cache[cache_key]
-            
-            # Get extended date range for price data (before and after article)
-            start_date = article_datetime.date() - timedelta(days=2)
-            end_date = article_datetime.date() + timedelta(days=8)  # Extended for end-of-week calculation
-            
-            # Fetch stock data
-            stock = yf.Ticker(ticker)
-            hist_data = stock.history(start=start_date, end=end_date, interval='1h')
-            
-            if hist_data.empty:
-                logger.warning(f"No price data found for {ticker} around {article_datetime}")
-                return None
-            
-            # Get the baseline price (closest to article time, before publication)
-            article_time = article_datetime
-            before_article = hist_data[hist_data.index <= article_time]
-            
-            if before_article.empty:
-                # If no data before article, use the first available price
-                baseline_price = hist_data['Close'].iloc[0]
-                baseline_time = hist_data.index[0]
-            else:
-                baseline_price = before_article['Close'].iloc[-1]
-                baseline_time = before_article.index[-1]
-            
-            # Calculate time intervals after article
-            one_hour_after = article_time + timedelta(hours=1)
-            four_hours_after = article_time + timedelta(hours=4)
-            
-            # End of day (market close at 4 PM ET)
-            eod_time = article_time.replace(hour=21, minute=0, second=0, microsecond=0)  # 4 PM ET in UTC
-            if article_time.hour >= 21:  # If article is after market close, use next day
-                eod_time += timedelta(days=1)
-            
-            # End of week (Friday market close)
-            days_until_friday = (4 - article_time.weekday()) % 7  # 0=Monday, 4=Friday
-            if days_until_friday == 0 and article_time.hour >= 21:
-                days_until_friday = 7  # Next Friday if it's Friday after market close
-            eow_time = (article_time + timedelta(days=days_until_friday)).replace(hour=21, minute=0, second=0, microsecond=0)
-            
-            # Get prices at each interval
-            def get_closest_price(target_time, data):
-                """Get the closest available price to target time"""
-                if data.empty:
-                    return None, None
-                    
-                # Find closest timestamp
-                time_diffs = abs(data.index - target_time)
-                closest_idx = time_diffs.argmin()
-                closest_time = data.index[closest_idx]
-                closest_price = data['Close'].iloc[closest_idx]
-                
-                return closest_price, closest_time
-            
-            # Get prices for each interval
-            price_1h, time_1h = get_closest_price(one_hour_after, hist_data)
-            price_4h, time_4h = get_closest_price(four_hours_after, hist_data)
-            price_eod, time_eod = get_closest_price(eod_time, hist_data)
-            price_eow, time_eow = get_closest_price(eow_time, hist_data)
-            
-            # Calculate percentage changes
-            def calc_pct_change(current_price, base_price):
-                if current_price is None or base_price is None or base_price == 0:
-                    return None
-                return ((current_price - base_price) / base_price) * 100
-            
-            pct_change_1h = calc_pct_change(price_1h, baseline_price)
-            pct_change_4h = calc_pct_change(price_4h, baseline_price)
-            pct_change_eod = calc_pct_change(price_eod, baseline_price)
-            pct_change_eow = calc_pct_change(price_eow, baseline_price)
-            
-            # Determine overall price direction (using end-of-day as primary indicator)
-            if pct_change_eod is not None:
-                price_direction = "Positive ↑" if pct_change_eod > 0 else "Negative ↓"
-            elif pct_change_4h is not None:
-                price_direction = "Positive ↑" if pct_change_4h > 0 else "Negative ↓"
-            elif pct_change_1h is not None:
-                price_direction = "Positive ↑" if pct_change_1h > 0 else "Negative ↓"
-            else:
-                price_direction = "Unknown"
-            
-            # Create comprehensive price data dictionary
-            price_data = {
-                'baseline_price': round(baseline_price, 2),
-                'baseline_time': baseline_time,
-                'price_1h': round(price_1h, 2) if price_1h else None,
-                'price_4h': round(price_4h, 2) if price_4h else None,
-                'price_eod': round(price_eod, 2) if price_eod else None,
-                'price_eow': round(price_eow, 2) if price_eow else None,
-                'pct_change_1h': round(pct_change_1h, 2) if pct_change_1h else None,
-                'pct_change_4h': round(pct_change_4h, 2) if pct_change_4h else None,
-                'pct_change_eod': round(pct_change_eod, 2) if pct_change_eod else None,
-                'pct_change_eow': round(pct_change_eow, 2) if pct_change_eow else None,
-                'price_direction': price_direction,
-                'time_1h': time_1h,
-                'time_4h': time_4h,
-                'time_eod': time_eod,
-                'time_eow': time_eow
-            }
-            
-            # Cache the result
-            self.price_cache[cache_key] = price_data
-            
-            logger.info(f"Price data for {ticker}: {price_direction} | 1H: {pct_change_1h}% | 4H: {pct_change_4h}% | EOD: {pct_change_eod}% | EOW: {pct_change_eow}%")
-            
-            return price_data
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch price data for {ticker}: {e}")
-            return None
-    
-    def analyze_sentiment_vs_price(self, sentiment_score, price_data):
-        """Analyze correlation between sentiment and price movement"""
+    def get_price_data(self, ticker, article_datetime):
+        price_data = self.price_analyzer.get_historical_stock_price_simplified(ticker, article_datetime)
         if not price_data:
-            return {"accuracy": None, "prediction": "Unknown"}
-        
-        # Predict direction based on sentiment
-        predicted_direction = "Positive ↑" if sentiment_score > 0 else "Negative ↓" if sentiment_score < 0 else "Neutral"
-        actual_direction = price_data.get('price_direction', 'Unknown')
-        
-        # Calculate accuracy for each time interval
-        accuracy_metrics = {}
-        for interval in ['1h', '4h', 'eod', 'eow']:
-            pct_change = price_data.get(f'pct_change_{interval}')
-            if pct_change is not None:
-                actual_positive = pct_change > 0
-                predicted_positive = sentiment_score > 0
-                accuracy_metrics[f'accuracy_{interval}'] = actual_positive == predicted_positive
+            return None
         
         return {
-            "predicted_direction": predicted_direction,
-            "actual_direction": actual_direction,
-            "prediction_correct": predicted_direction == actual_direction,
-            **accuracy_metrics
+            'baseline_price': price_data['baseline_price'],
+            'eod_price': price_data.get('price_eod'),
+            'pct_change_eod': price_data.get('pct_change_eod'),
+            'price_direction': price_data.get('direction_eod', 'No Data'),
+            'price_1h': price_data.get('price_1h'),
+            'price_4h': price_data.get('price_4h'),
+            'price_eow': price_data.get('price_eow'),
+            'pct_change_1h': price_data.get('pct_change_1h'),
+            'pct_change_4h': price_data.get('pct_change_4h'),
+            'pct_change_eow': price_data.get('pct_change_eow'),
+            'direction_1h': price_data.get('direction_1h'),
+            'direction_4h': price_data.get('direction_4h'),
+            'direction_eow': price_data.get('direction_eow'),
+            'data_interval': price_data['data_interval'],
+            'data_points': price_data['data_points']
         }
     
     def parse_datetime(self, s):
-        """Parse datetime with common patterns"""
         if not s:
             return None
         
         now = datetime.now()
         s = s.strip().lower()
         
-        # Relative dates
         if s.startswith("today"):
             return now.replace(second=0, microsecond=0)
         if s.startswith("yesterday"):
             return (now - timedelta(days=1)).replace(second=0, microsecond=0)
         
-        # Standard formats
-        for fmt in ["%b-%d-%y %I:%M%p", "%Y-%m-%d %I:%M%p", "%m/%d/%Y %I:%M%p"]:
+        formats = [
+            "%b-%d-%y %I:%M%p", "%Y-%m-%d %I:%M%p", "%m/%d/%Y %I:%M%p",
+            "%b %d %I:%M%p", "%m-%d-%y %H:%M"
+        ]
+        
+        for fmt in formats:
             try:
-                return datetime.strptime(s, fmt)
+                parsed = datetime.strptime(s, fmt)
+                if parsed.year == 1900:
+                    parsed = parsed.replace(year=now.year)
+                return parsed
             except ValueError:
                 continue
-        
-        # Time only
-        time_match = re.search(r"(\d{1,2}:\d{2}[ap]m)", s)
-        if time_match:
-            try:
-                time_obj = datetime.strptime(time_match.group(1).upper(), "%I:%M%p").time()
-                return datetime.combine(now.date(), time_obj)
-            except ValueError:
-                pass
-        
         return None
     
     def preprocess_text(self, text):
-        """Clean and preprocess text"""
         if not text:
             return ""
         
-        # Clean and tokenize
         text = re.sub(r"http\S+|www\S+|https\S+", "", text.lower())
         text = re.sub(r"[^a-z\s]", " ", text)
         tokens = word_tokenize(re.sub(r"\s+", " ", text).strip())
         
-        # Filter and lemmatize
         return " ".join(
             self.lemmatizer.lemmatize(token) for token in tokens 
             if token not in self.stopwords and len(token) > 1
         )
     
     def extract_mentions_and_sentiment(self, text, exclude_ticker=None):
-        """Extract ticker mentions and analyze sentiment"""
-        # Extract ticker mentions
         potential_tickers = re.findall(r'\b[A-Z]{1,5}\b', text)
-        mentions = list(dict.fromkeys([  # Remove duplicates preserving order
+        mentions = list(dict.fromkeys([
             t for t in potential_tickers 
             if t in self.valid_tickers and t != exclude_ticker
         ]))
         
-        # Sentiment analysis
         processed_text = self.preprocess_text(text)
-        try:
-            keywords = self.kw_model.extract_keywords(
-                processed_text, keyphrase_ngram_range=(1, 3), 
-                stop_words='english', top_n=15, use_mmr=True, diversity=0.3
-            )
-            
-            pos_keywords, neg_keywords = [], []
-            for keyword, score in keywords:
-                kw_clean = keyword.lower().strip()
-                sentiment = SENTIMENT_KEYWORDS.get(kw_clean)
+        pos_keywords, neg_keywords = [], []
+        
+        if self.kw_model and SENTIMENT_KEYWORDS:
+            try:
+                keywords = self.kw_model.extract_keywords(
+                    processed_text, keyphrase_ngram_range=(1, 3), 
+                    stop_words='english', top_n=15, use_mmr=True, diversity=0.3
+                )
                 
-                # Fuzzy matching if no direct match
-                if not sentiment:
-                    matches = get_close_matches(kw_clean, SENTIMENT_KEYWORDS.keys(), n=1, cutoff=0.8)
-                    sentiment = SENTIMENT_KEYWORDS.get(matches[0]) if matches else None
-                
-                if sentiment == "positive":
-                    pos_keywords.append(keyword)
-                elif sentiment == "negative":
-                    neg_keywords.append(keyword)
-            
-            return mentions, pos_keywords, neg_keywords, processed_text
-            
-        except Exception as e:
-            logger.debug(f"Keyword extraction failed: {e}")
-            return mentions, [], [], processed_text
+                for keyword, score in keywords:
+                    kw_clean = keyword.lower().strip()
+                    sentiment = SENTIMENT_KEYWORDS.get(kw_clean)
+                    
+                    if not sentiment:
+                        matches = get_close_matches(kw_clean, SENTIMENT_KEYWORDS.keys(), n=1, cutoff=0.8)
+                        sentiment = SENTIMENT_KEYWORDS.get(matches[0]) if matches else None
+                    
+                    if sentiment == "positive":
+                        pos_keywords.append(keyword)
+                    elif sentiment == "negative":
+                        neg_keywords.append(keyword)
+                        
+            except Exception as e:
+                logger.debug(f"Keyword extraction failed: {e}")
+        
+        return mentions, pos_keywords, neg_keywords, processed_text
     
     def scrape_article(self, url):
-        """Scrape article content from URL"""
         try:
             response = self.session.get(url, headers=self.headers, timeout=15)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            # Extract content from paragraphs
             paragraphs = soup.find_all("p")
             text = " ".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
             
@@ -375,10 +385,8 @@ class NewsProcessor:
             return ""
     
     def fallback_search(self, headline):
-        """Fallback scraping via Google search"""
         try:
             search_results = list(search(headline, num_results=3, lang="en"))
-            cutoff_date = datetime.now() - timedelta(days=CONFIG['DAYS_BACK'])
             
             for url in search_results:
                 text = self.scrape_article(url)
@@ -392,50 +400,32 @@ class NewsProcessor:
         return "", ""
     
     def fetch_finviz_news(self, ticker):
-        """Fetch news for ticker from Finviz with price analysis"""
         url = f"https://finviz.com/quote.ashx?t={ticker}"
         try:
-            response = self.session.get(url, headers=self.headers, timeout=15)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
         except Exception as e:
-            logger.error(f"Failed to fetch Finviz for {ticker}: {e}")
+            logger.error(f"Finviz fetch failed for {ticker}: {e}")
             return []
         
         soup = BeautifulSoup(response.text, "html.parser")
         news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
         
         if not news_table:
-            logger.warning(f"No news table for {ticker}")
             return []
         
         articles = []
         cutoff_date = datetime.now() - timedelta(days=CONFIG['DAYS_BACK'])
-        last_date = None
         
         for row in news_table.find_all("tr"):
             cols = row.find_all("td")
             if len(cols) < 2:
                 continue
             
-            # Parse datetime
-            datetime_text = cols[0].get_text(strip=True)
-            parsed_dt = self.parse_datetime(datetime_text)
-            
-            if parsed_dt:
-                # Handle time inheritance
-                is_time_only = bool(re.search(r"^\s*\d{1,2}:\d{2}[ap]m\s*$", datetime_text.lower()))
-                if is_time_only and last_date:
-                    final_datetime = datetime.combine(last_date, parsed_dt.time())
-                else:
-                    final_datetime = parsed_dt
-                    last_date = parsed_dt.date()
-            else:
+            parsed_dt = self.parse_datetime(cols[0].get_text(strip=True))
+            if not parsed_dt or parsed_dt < cutoff_date:
                 continue
             
-            if final_datetime < cutoff_date:
-                continue
-            
-            # Extract article info
             link_element = cols[1].find("a")
             if not link_element:
                 continue
@@ -443,7 +433,6 @@ class NewsProcessor:
             article_url = urljoin("https://finviz.com/", link_element["href"])
             headline = link_element.get_text(strip=True)
             
-            # Get article text
             article_text = self.scrape_article(article_url)
             if not article_text:
                 article_text, fallback_url = self.fallback_search(headline)
@@ -453,156 +442,173 @@ class NewsProcessor:
             if not article_text:
                 continue
             
-            # Process article sentiment
             mentions, pos_kw, neg_kw, tokens = self.extract_mentions_and_sentiment(article_text, ticker)
             sentiment_score = len(pos_kw) - len(neg_kw)
             
-            # Get price data for this article
-            price_data = self.get_stock_price_data(ticker, final_datetime)
+            price_data = self.get_price_data(ticker, parsed_dt)
             
-            # Analyze sentiment vs price correlation
-            prediction_analysis = self.analyze_sentiment_vs_price(sentiment_score, price_data)
-            
-            # Create comprehensive article data
             article_entry = {
                 "ticker": ticker,
-                "datetime": datetime_text,
-                "parsed_datetime": final_datetime,
+                "datetime": cols[0].get_text(strip=True),
                 "headline": headline,
                 "url": article_url,
                 "text": article_text,
                 "tokens": tokens,
+                "sentiment_score": sentiment_score,
                 "pos_keywords": ", ".join(pos_kw),
                 "neg_keywords": ", ".join(neg_kw),
-                "sentiment_score": sentiment_score,
                 "total_keywords": len(pos_kw) + len(neg_kw),
-                "mentions": ", ".join(mentions)
+                "mentions": ", ".join(mentions),
+                "predicted_direction": "Positive" if sentiment_score > 0 else "Negative"
             }
             
-            # Add price data if available
             if price_data:
-                article_entry.update({
-                    "baseline_price": price_data['baseline_price'],
-                    "price_1h": price_data['price_1h'],
-                    "price_4h": price_data['price_4h'],
-                    "price_eod": price_data['price_eod'],
-                    "price_eow": price_data['price_eow'],
-                    "pct_change_1h": price_data['pct_change_1h'],
-                    "pct_change_4h": price_data['pct_change_4h'],
-                    "pct_change_eod": price_data['pct_change_eod'],
-                    "pct_change_eow": price_data['pct_change_eow'],
-                    "price_direction": price_data['price_direction']
-                })
-            
-            # Add prediction analysis
-            article_entry.update({
-                "predicted_direction": prediction_analysis['predicted_direction'],
-                "prediction_correct": prediction_analysis.get('prediction_correct', False),
-                "accuracy_1h": prediction_analysis.get('accuracy_1h'),
-                "accuracy_4h": prediction_analysis.get('accuracy_4h'),
-                "accuracy_eod": prediction_analysis.get('accuracy_eod'),
-                "accuracy_eow": prediction_analysis.get('accuracy_eow')
-            })
+                article_entry.update(price_data)
+                
+                is_sentiment_positive = sentiment_score > 0
+                intervals = ['1h', '4h', 'eod', 'eow']
+                
+                for interval in intervals:
+                    pct_change_key = f'pct_change_{interval}'
+                    if pct_change_key in price_data:
+                        article_entry[f'prediction_correct_{interval}'] = self._check_prediction_accuracy(
+                            is_sentiment_positive, price_data[pct_change_key]
+                        )
             
             articles.append(article_entry)
         
-        logger.info(f"Found {len(articles)} articles for {ticker} with price analysis")
+        logger.info(f"Found {len(articles)} articles for {ticker}")
         return articles
+    
+    def _check_prediction_accuracy(self, is_sentiment_positive, pct_change):
+        if pct_change is None:
+            return None
+        return (is_sentiment_positive and pct_change > 0) or (not is_sentiment_positive and pct_change < 0)
 
 def init_database():
-    """Initialize SQLite database with price columns"""
     conn = sqlite3.connect(CONFIG['DB_PATH'])
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            ticker TEXT, datetime TEXT, parsed_datetime TIMESTAMP, headline TEXT,
-            url TEXT UNIQUE, text TEXT, tokens TEXT, pos_keywords TEXT, 
-            neg_keywords TEXT, sentiment_score INTEGER, total_keywords INTEGER, mentions TEXT,
-            baseline_price REAL, price_1h REAL, price_4h REAL, price_eod REAL, price_eow REAL,
-            pct_change_1h REAL, pct_change_4h REAL, pct_change_eod REAL, pct_change_eow REAL,
-            price_direction TEXT, predicted_direction TEXT, prediction_correct BOOLEAN,
-            accuracy_1h BOOLEAN, accuracy_4h BOOLEAN, accuracy_eod BOOLEAN, accuracy_eow BOOLEAN
-        )
-    """)
+    cursor = conn.cursor()
+    
+    all_required_columns = {
+        'ticker': 'TEXT', 'datetime': 'TEXT', 'headline': 'TEXT', 'url': 'TEXT UNIQUE', 'text': 'TEXT',
+        'tokens': 'TEXT', 'sentiment_score': 'INTEGER', 'pos_keywords': 'TEXT', 'neg_keywords': 'TEXT', 
+        'total_keywords': 'INTEGER', 'mentions': 'TEXT', 'baseline_price': 'REAL', 'eod_price': 'REAL',
+        'pct_change_eod': 'REAL', 'price_direction': 'TEXT', 'predicted_direction': 'TEXT',
+        'prediction_correct': 'BOOLEAN', 'price_1h': 'REAL', 'price_4h': 'REAL', 'price_eow': 'REAL',
+        'pct_change_1h': 'REAL', 'pct_change_4h': 'REAL', 'pct_change_eow': 'REAL',
+        'direction_1h': 'TEXT', 'direction_4h': 'TEXT', 'direction_eow': 'TEXT',
+        'data_interval': 'TEXT', 'data_points': 'INTEGER', 'prediction_correct_1h': 'BOOLEAN',
+        'prediction_correct_4h': 'BOOLEAN', 'prediction_correct_eod': 'BOOLEAN', 'prediction_correct_eow': 'BOOLEAN'
+    }
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'")
+    table_exists = cursor.fetchone() is not None
+    
+    if table_exists:
+        cursor.execute("PRAGMA table_info(articles)")
+        existing_columns = {row[1]: row[2] for row in cursor.fetchall()}
+        
+        missing_columns = set(all_required_columns.keys()) - set(existing_columns.keys())
+        
+        if missing_columns:
+            for col_name in missing_columns:
+                try:
+                    col_type = all_required_columns[col_name]
+                    cursor.execute(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}")
+                except Exception as e:
+                    logger.warning(f"Could not add column {col_name}: {e}")
+    else:
+        column_defs = [f"{col} {dtype}" for col, dtype in all_required_columns.items()]
+        create_sql = f"CREATE TABLE articles ({', '.join(column_defs)})"
+        cursor.execute(create_sql)
+        logger.info("Created new articles table")
+    
     conn.commit()
     conn.close()
-    logger.info(f"Database initialized with price analysis columns: {CONFIG['DB_PATH']}")
 
 def save_articles(articles):
-    """Save articles to CSV and database"""
     if not articles:
         logger.warning("No articles to save")
         return
     
     df = pd.DataFrame(articles)
-    
-    # Save to CSV
     df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
     logger.info(f"Saved {len(articles)} articles to {CONFIG['CSV_OUTPUT']}")
     
-    # Calculate and display summary statistics
-    if 'sentiment_score' in df.columns and 'price_direction' in df.columns:
-        total_articles = len(df)
-        correct_predictions = df['prediction_correct'].sum() if 'prediction_correct' in df.columns else 0
-        accuracy_rate = (correct_predictions / total_articles * 100) if total_articles > 0 else 0
-        
-        logger.info(f"Prediction Accuracy: {correct_predictions}/{total_articles} ({accuracy_rate:.1f}%)")
-        
-        # Show average price changes by sentiment
-        positive_sentiment = df[df['sentiment_score'] > 0]
-        negative_sentiment = df[df['sentiment_score'] < 0]
-        
-        if not positive_sentiment.empty:
-            avg_pos_change = positive_sentiment['pct_change_eod'].mean()
-            logger.info(f"Average EOD price change for positive sentiment: {avg_pos_change:.2f}%")
-        
-        if not negative_sentiment.empty:
-            avg_neg_change = negative_sentiment['pct_change_eod'].mean()
-            logger.info(f"Average EOD price change for negative sentiment: {avg_neg_change:.2f}%")
+    # Show accuracy stats
+    intervals = ['1h', '4h', 'eod', 'eow']
+    for interval in intervals:
+        col = f'prediction_correct_{interval}'
+        if col in df.columns:
+            valid = df[col].dropna()
+            if not valid.empty:
+                correct = valid.sum()
+                total = len(valid)
+                logger.info(f"Prediction accuracy {interval.upper()}: {correct}/{total} ({correct/total*100:.1f}%)")
+    
+    # Show average price changes
+    for interval in intervals:
+        col = f'pct_change_{interval}'
+        if col in df.columns:
+            avg_change = df[col].mean()
+            if not pd.isna(avg_change):
+                logger.info(f"Average price change {interval.upper()}: {avg_change:+.2f}%")
     
     # Save to database
     conn = sqlite3.connect(CONFIG['DB_PATH'])
     try:
-        existing_urls = pd.read_sql("SELECT url FROM articles", conn)["url"].tolist()
-        new_articles = df[~df["url"].isin(existing_urls)]
+        try:
+            existing_urls = pd.read_sql("SELECT url FROM articles", conn)["url"].tolist()
+            new_articles = df[~df["url"].isin(existing_urls)]
+        except Exception as e:
+            logger.warning(f"Could not check existing URLs: {e}")
+            new_articles = df
         
         if not new_articles.empty:
-            new_articles.to_sql("articles", conn, if_exists="append", index=False)
-            logger.info(f"Inserted {len(new_articles)} new articles to database")
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(articles)")
+            db_columns = [row[1] for row in cursor.fetchall()]
+            
+            save_columns = [col for col in new_articles.columns if col in db_columns]
+            if save_columns:
+                new_articles[save_columns].to_sql("articles", conn, if_exists="append", index=False)
+                logger.info(f"Added {len(new_articles)} new articles to database")
+            else:
+                logger.error("No matching columns found")
+        else:
+            logger.info("No new articles to add")
+            
     except Exception as e:
         logger.error(f"Database save failed: {e}")
     finally:
         conn.close()
 
 def main():
-    """Main execution"""
-    logger.info("Starting financial news scraper with price analysis")
+    logger.info("Starting financial news scraper")
     
-    # Initialize
     init_database()
     processor = NewsProcessor()
     
-    # Load tickers
     try:
         df = pd.read_csv(CONFIG['CSV_INPUT'])
         tickers = df["Ticker"].dropna().str.upper().unique()[:CONFIG['MAX_TICKERS']]
-        logger.info(f"Processing {len(tickers)} tickers: {list(tickers)}")
+        logger.info(f"Processing {len(tickers)} tickers")
     except Exception as e:
         logger.error(f"Failed to read {CONFIG['CSV_INPUT']}: {e}")
         return
     
-    # Process tickers
     all_articles = []
     for ticker in tickers:
         logger.info(f"Processing: {ticker}")
         try:
             articles = processor.fetch_finviz_news(ticker)
             all_articles.extend(articles)
-            sleep(random.uniform(2, 4))  # Slightly longer delay for price API calls
+            sleep(random.uniform(1, 3))
         except Exception as e:
             logger.error(f"Failed to process {ticker}: {e}")
     
     save_articles(all_articles)
-    logger.info("Scraper with price analysis completed")
+    logger.info("Scraper completed successfully")
 
 if __name__ == "__main__":
     main()
