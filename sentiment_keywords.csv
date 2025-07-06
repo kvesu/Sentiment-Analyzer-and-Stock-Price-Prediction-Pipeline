@@ -1,0 +1,166 @@
+keyword,sentiment
+merger,positive
+acquisition,positive
+buyout,positive
+takeover,positive
+stimulus,positive
+monetary stimulus,positive
+fiscal stimulus,positive
+rate cuts,positive
+big cuts,positive
+rate reduction,positive
+cut rates,positive
+pboc,positive
+fed support,positive
+central bank support,positive
+liquidity,positive
+liquidity injection,positive
+cash injection,positive
+qe,positive
+quantitative easing,positive
+asset purchases,positive
+dovish,positive
+accommodative,positive
+loose monetary,positive
+earnings beat,positive
+beat expectations,positive
+strong earnings,positive
+revenue growth,positive
+profit growth,positive
+margin expansion,positive
+dividend increase,positive
+dividend hike,positive
+share buyback,positive
+stock split,positive
+bullish,positive
+rally,positive
+surge,positive
+breakthrough,positive
+innovation,positive
+patent,positive
+approval,positive
+expansion,positive
+growth,positive
+recovery,positive
+rebound,positive
+upgrade,positive
+outperform,positive
+buy rating,positive
+strong buy,positive
+partnership,positive
+alliance,positive
+joint venture,positive
+contract win,positive
+deal secured,positive
+order backlog,positive
+market share,positive
+competitive advantage,positive
+moat,positive
+free cash flow,positive
+cash generation,positive
+debt reduction,positive
+cpi,negative
+inflation,negative
+high inflation,negative
+rising prices,negative
+qt,negative
+quantitative tightening,negative
+qe taper,negative
+tapering,negative
+tightening,negative
+hawkish,negative
+restrictive policy,negative
+rate hikes,negative
+interest rate increase,negative
+higher rates,negative
+recession,negative
+downturn,negative
+contraction,negative
+slowdown,negative
+bearish,negative
+decline,negative
+crash,negative
+plunge,negative
+earnings miss,negative
+miss expectations,negative
+weak earnings,negative
+revenue decline,negative
+profit warning,negative
+margin compression,negative
+dividend cut,negative
+dividend suspension,negative
+share dilution,negative
+bankruptcy,negative
+insolvency,negative
+default,negative
+restructuring,negative
+layoffs,negative
+job cuts,negative
+workforce reduction,negative
+downgrade,negative
+underperform,negative
+sell rating,negative
+avoid,negative
+investigation,negative
+lawsuit,negative
+regulatory action,negative
+fine,negative
+supply chain,negative
+shortage,negative
+disruption,negative
+delay,negative
+competition,negative
+market pressure,negative
+pricing pressure,negative
+debt burden,negative
+cash burn,negative
+liquidity concerns,negative
+guidance cut,negative
+outlook reduced,negative
+forecast lowered,negative
+volatility,negative
+uncertainty,negative
+risk,negative
+concern,negative
+sell-off,negative
+correction,negative
+bear market,negative
+loss,negative
+weak demand,negative
+declining sales,negative
+market share loss,negative
+gold demand,positive
+gold shortage,positive
+safe haven,positive
+mining output,positive
+ore grade,positive
+resource expansion,positive
+commodity prices,positive
+precious metals,positive
+inflation hedge,positive
+geopolitical tension,positive
+currency debasement,positive
+dollar weakness,positive
+mining costs,negative
+environmental concerns,negative
+permit delays,negative
+labor strikes,negative
+operational issues,negative
+production cuts,negative
+optimism,positive
+confidence,positive
+momentum,positive
+strength,positive
+resilience,positive
+robust,positive
+solid,positive
+stable,positive
+pessimism,negative
+fear,negative
+panic,negative
+weakness,negative
+fragile,negative
+unstable,negative
+vulnerable,negative
+risk-off,negative
+

@@ -13,25 +13,48 @@ from difflib import get_close_matches
 from googlesearch import search
 import numpy as np
 import json
-from word_analysis_framework import NewsAnalysisFramework
+from word_analysis_framework import DynamicSentimentLearner, EnhancedNewsProcessor
 
 # Configuration
 CONFIG = {
     'DB_PATH': "articles.db",
     'CSV_INPUT': "finviz.csv", 
-    'CSV_OUTPUT': "finviz_first5.csv",
-    'MAX_TICKERS': 5,
+    'CSV_OUTPUT': "scraped_articles.csv",
+    'MAX_TICKERS': None,
+    'BATCH_SIZE': 50,
+    'BATCH_START': 0,
     'DAYS_BACK': 7,
-    'USER_AGENT': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    'USER_AGENT': "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    'NO_NEWS_CACHE': "tickers_with_no_news.json",  
+    'REFRESH_NO_NEWS_CACHE': False                 
 }
+
+# No news cache loading
+def load_no_news_cache():
+    if os.path.exists(CONFIG['NO_NEWS_CACHE']) and not CONFIG['REFRESH_NO_NEWS_CACHE']:
+        with open(CONFIG['NO_NEWS_CACHE'], 'r') as f:
+            return set(json.load(f))
+    return set()
+
+def save_no_news_cache(tickers):
+    try:
+        with open(CONFIG['NO_NEWS_CACHE'], 'w') as f:
+            json.dump(list(tickers), f)
+    except Exception as e:
+        logger.warning(f"Failed to save no-news cache: {e}")
 
 # Suppress yfinance warnings
 yf_logger = logging.getLogger("yfinance")
 yf_logger.setLevel(logging.ERROR)
 
 # Load sentiment keywords from CSV
-sentiment_df = pd.read_csv("sentiment_keywords.csv")
-SENTIMENT_KEYWORDS = dict(zip(sentiment_df["keyword"], sentiment_df["sentiment"]))
+try:
+    sentiment_df = pd.read_csv("sentiment_keywords.csv")
+    SENTIMENT_KEYWORDS = dict(zip(sentiment_df["keyword"], sentiment_df["sentiment"]))
+except FileNotFoundError:
+    SENTIMENT_KEYWORDS = {}
+    print("Warning: sentiment_keywords.csv not found, using empty sentiment dictionary")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -73,7 +96,7 @@ class SimplifiedPriceAnalyzer:
             if baseline_price is None:
                 return None
             
-            # Calculate intervals
+            # Calculate intervals - FIXED: Removed the problematic time offsets
             intervals = {
                 '1h': timedelta(hours=1),
                 '4h': timedelta(hours=4),
@@ -183,12 +206,10 @@ class SimplifiedPriceAnalyzer:
         return eod_time - article_datetime
     
     def _get_end_of_week_delta(self, article_datetime):
+        # FIXED: Simplified end of week calculation
         days_until_friday = (4 - article_datetime.weekday()) % 7
-        if days_until_friday == 0:
-            if article_datetime.hour >= 16:
-                days_until_friday = 7
-        elif days_until_friday == 0:
-            days_until_friday = 0
+        if days_until_friday == 0 and article_datetime.hour >= 16:
+            days_until_friday = 7
         
         eow_time = article_datetime + timedelta(days=days_until_friday)
         eow_time = eow_time.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -202,12 +223,15 @@ class NewsProcessor:
         self.lemmatizer = WordNetLemmatizer()
         try:
             self.kw_model = KeyBERT(model='all-MiniLM-L6-v2')
-        except:
+        except Exception as e:
             self.kw_model = None
-            logger.warning("KeyBERT model not available")
+            logger.warning(f"KeyBERT model not available: {e}")
         self.headers = {"User-Agent": CONFIG['USER_AGENT']}
         self.price_analyzer = SimplifiedPriceAnalyzer()
-        self.word_analyzer = NewsAnalysisFramework()
+        
+        # Initialize enhanced sentiment analysis
+        self.sentiment_learner = DynamicSentimentLearner()
+        self.enhanced_processor = EnhancedNewsProcessor()
         self.sentiment_weights = self.load_sentiment_weights()
     
     def load_sentiment_weights(self):
@@ -267,7 +291,10 @@ class NewsProcessor:
     def _setup_nltk(self):
         for name in ['stopwords', 'punkt', 'wordnet']:
             try:
-                nltk.data.find(f'tokenizers/{name}' if name == 'punkt' else f'corpora/{name}')
+                if name == 'punkt':
+                    nltk.data.find('tokenizers/punkt')
+                else:
+                    nltk.data.find(f'corpora/{name}')
             except LookupError:
                 nltk.download(name, quiet=True)
         return set(stopwords.words("english"))
@@ -302,14 +329,28 @@ class NewsProcessor:
         now = datetime.now()
         s = s.strip().lower()
         
+        # FIXED: Better handling of relative dates
         if s.startswith("today"):
-            return now.replace(second=0, microsecond=0)
+            return now.replace(hour=9, minute=30, second=0, microsecond=0)
         if s.startswith("yesterday"):
-            return (now - timedelta(days=1)).replace(second=0, microsecond=0)
+            return (now - timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+        
+        # Handle relative time strings like "1h ago", "2 hours ago", etc.
+        time_ago_patterns = [
+            (r'(\d+)h ago', lambda m: now - timedelta(hours=int(m.group(1)))),
+            (r'(\d+) hours? ago', lambda m: now - timedelta(hours=int(m.group(1)))),
+            (r'(\d+)m ago', lambda m: now - timedelta(minutes=int(m.group(1)))),
+            (r'(\d+) minutes? ago', lambda m: now - timedelta(minutes=int(m.group(1)))),
+        ]
+        
+        for pattern, func in time_ago_patterns:
+            match = re.search(pattern, s)
+            if match:
+                return func(match).replace(second=0, microsecond=0)
         
         formats = [
             "%b-%d-%y %I:%M%p", "%Y-%m-%d %I:%M%p", "%m/%d/%Y %I:%M%p",
-            "%b %d %I:%M%p", "%m-%d-%y %H:%M"
+            "%b %d %I:%M%p", "%m-%d-%y %H:%M", "%b-%d-%y", "%m/%d/%Y"
         ]
         
         for fmt in formats:
@@ -317,6 +358,9 @@ class NewsProcessor:
                 parsed = datetime.strptime(s, fmt)
                 if parsed.year == 1900:
                     parsed = parsed.replace(year=now.year)
+                # If no time specified, assume market open
+                if parsed.hour == 0 and parsed.minute == 0:
+                    parsed = parsed.replace(hour=9, minute=30)
                 return parsed
             except ValueError:
                 continue
@@ -376,8 +420,29 @@ class NewsProcessor:
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            paragraphs = soup.find_all("p")
-            text = " ".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
+            # FIXED: Better content extraction
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            # Try to find main content areas first
+            content_selectors = [
+                'article', '.article-content', '.content', '.post-content',
+                '.entry-content', 'main', '[role="main"]'
+            ]
+            
+            text = ""
+            for selector in content_selectors:
+                content = soup.select_one(selector)
+                if content:
+                    paragraphs = content.find_all("p")
+                    text = " ".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
+                    break
+            
+            # Fallback to all paragraphs
+            if not text:
+                paragraphs = soup.find_all("p")
+                text = " ".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
             
             return text if len(text) >= 200 else ""
         except Exception as e:
@@ -412,6 +477,7 @@ class NewsProcessor:
         news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
         
         if not news_table:
+            logger.warning(f"No news table found for {ticker}")
             return []
         
         articles = []
@@ -443,6 +509,12 @@ class NewsProcessor:
                 continue
             
             mentions, pos_kw, neg_kw, tokens = self.extract_mentions_and_sentiment(article_text, ticker)
+            
+            # Use enhanced sentiment analysis
+            full_text = f"{headline} {article_text}"
+            enhanced_sentiment = self.enhanced_processor.calculate_enhanced_sentiment(full_text)
+            
+            # Traditional sentiment score for comparison
             sentiment_score = len(pos_kw) - len(neg_kw)
             
             price_data = self.get_price_data(ticker, parsed_dt)
@@ -459,13 +531,23 @@ class NewsProcessor:
                 "neg_keywords": ", ".join(neg_kw),
                 "total_keywords": len(pos_kw) + len(neg_kw),
                 "mentions": ", ".join(mentions),
-                "predicted_direction": "Positive" if sentiment_score > 0 else "Negative"
+                
+                # Enhanced sentiment scores
+                "sentiment_dynamic": enhanced_sentiment.get('dynamic_weights', 0),
+                "sentiment_ml": enhanced_sentiment.get('ml_prediction', 0),
+                "sentiment_keyword": enhanced_sentiment.get('keyword_based', 0),
+                "sentiment_combined": enhanced_sentiment.get('combined', 0),
+                
+                # Prediction based on combined sentiment
+                "predicted_direction": "Positive" if enhanced_sentiment.get('combined', 0) > 0 else "Negative",
+                "prediction_confidence": abs(enhanced_sentiment.get('combined', 0))
             }
             
             if price_data:
                 article_entry.update(price_data)
                 
-                is_sentiment_positive = sentiment_score > 0
+                # Check prediction accuracy for enhanced sentiment
+                is_sentiment_positive = enhanced_sentiment.get('combined', 0) > 0
                 intervals = ['1h', '4h', 'eod', 'eow']
                 
                 for interval in intervals:
@@ -474,6 +556,17 @@ class NewsProcessor:
                         article_entry[f'prediction_correct_{interval}'] = self._check_prediction_accuracy(
                             is_sentiment_positive, price_data[pct_change_key]
                         )
+                        
+                        # Also check accuracy for different sentiment methods
+                        for method in ['dynamic', 'ml', 'keyword', 'combined']:
+                            sentiment_key = f'sentiment_{method}'
+                            if sentiment_key in enhanced_sentiment and enhanced_sentiment[sentiment_key] is not None:
+                                predicted_positive = enhanced_sentiment[sentiment_key] > 0
+                                if price_data[pct_change_key] is not None:
+                                    actual_positive = price_data[pct_change_key] > 0
+                                    article_entry[f'accuracy_{method}_{interval}'] = (
+                                        predicted_positive == actual_positive
+                                    )
             
             articles.append(article_entry)
         
@@ -484,6 +577,43 @@ class NewsProcessor:
         if pct_change is None:
             return None
         return (is_sentiment_positive and pct_change > 0) or (not is_sentiment_positive and pct_change < 0)
+    
+    def filter_tickers_with_news(self, tickers):
+        tickers = sorted(tickers)  # alphabetical order
+        
+        # Load cached tickers with no news
+        no_news_cache = load_no_news_cache()
+        
+        filtered = []
+        newly_no_news = set()
+        
+        for ticker in tickers:
+            if ticker in no_news_cache:
+                logger.info(f"Ticker {ticker} skipped (cached no news)")
+                continue
+            
+            url = f"https://finviz.com/quote.ashx?t={ticker}"
+            try:
+                response = self.session.get(url, headers=self.headers, timeout=10)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "html.parser")
+                news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
+                if news_table:
+                    filtered.append(ticker)
+                else:
+                    logger.info(f"Ticker {ticker} excluded: no news table found")
+                    newly_no_news.add(ticker)
+            except Exception as e:
+                logger.warning(f"Error checking ticker {ticker}: {e}")
+            
+            sleep(random.uniform(0.5, 1.5))  # polite delay
+        
+        # Update cache file with new no-news tickers
+        updated_no_news_cache = no_news_cache.union(newly_no_news)
+        save_no_news_cache(updated_no_news_cache)
+        
+        logger.info(f"Filtered tickers count: {len(filtered)} out of {len(tickers)}")
+        return filtered
 
 def init_database():
     conn = sqlite3.connect(CONFIG['DB_PATH'])
@@ -498,7 +628,15 @@ def init_database():
         'pct_change_1h': 'REAL', 'pct_change_4h': 'REAL', 'pct_change_eow': 'REAL',
         'direction_1h': 'TEXT', 'direction_4h': 'TEXT', 'direction_eow': 'TEXT',
         'data_interval': 'TEXT', 'data_points': 'INTEGER', 'prediction_correct_1h': 'BOOLEAN',
-        'prediction_correct_4h': 'BOOLEAN', 'prediction_correct_eod': 'BOOLEAN', 'prediction_correct_eow': 'BOOLEAN'
+        'prediction_correct_4h': 'BOOLEAN', 'prediction_correct_eod': 'BOOLEAN', 'prediction_correct_eow': 'BOOLEAN',
+        
+        # Enhanced sentiment columns
+        'sentiment_dynamic': 'REAL', 'sentiment_ml': 'REAL', 'sentiment_keyword': 'REAL', 'sentiment_combined': 'REAL',
+        'prediction_confidence': 'REAL',
+        'accuracy_dynamic_1h': 'BOOLEAN', 'accuracy_dynamic_4h': 'BOOLEAN', 'accuracy_dynamic_eod': 'BOOLEAN', 'accuracy_dynamic_eow': 'BOOLEAN',
+        'accuracy_ml_1h': 'BOOLEAN', 'accuracy_ml_4h': 'BOOLEAN', 'accuracy_ml_eod': 'BOOLEAN', 'accuracy_ml_eow': 'BOOLEAN',
+        'accuracy_keyword_1h': 'BOOLEAN', 'accuracy_keyword_4h': 'BOOLEAN', 'accuracy_keyword_eod': 'BOOLEAN', 'accuracy_keyword_eow': 'BOOLEAN',
+        'accuracy_combined_1h': 'BOOLEAN', 'accuracy_combined_4h': 'BOOLEAN', 'accuracy_combined_eod': 'BOOLEAN', 'accuracy_combined_eow': 'BOOLEAN'
     }
     
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'")
@@ -515,6 +653,7 @@ def init_database():
                 try:
                     col_type = all_required_columns[col_name]
                     cursor.execute(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Added column: {col_name}")
                 except Exception as e:
                     logger.warning(f"Could not add column {col_name}: {e}")
     else:
@@ -535,16 +674,19 @@ def save_articles(articles):
     df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
     logger.info(f"Saved {len(articles)} articles to {CONFIG['CSV_OUTPUT']}")
     
-    # Show accuracy stats
+    # Show accuracy stats for different sentiment methods
+    methods = ['dynamic', 'ml', 'keyword', 'combined']
     intervals = ['1h', '4h', 'eod', 'eow']
-    for interval in intervals:
-        col = f'prediction_correct_{interval}'
-        if col in df.columns:
-            valid = df[col].dropna()
-            if not valid.empty:
-                correct = valid.sum()
-                total = len(valid)
-                logger.info(f"Prediction accuracy {interval.upper()}: {correct}/{total} ({correct/total*100:.1f}%)")
+    
+    for method in methods:
+        for interval in intervals:
+            col = f'accuracy_{method}_{interval}'
+            if col in df.columns:
+                valid = df[col].dropna()
+                if not valid.empty:
+                    correct = valid.sum()
+                    total = len(valid)
+                    logger.info(f"Prediction accuracy {method.upper()} {interval.upper()}: {correct}/{total} ({correct/total*100:.1f}%)")
     
     # Show average price changes
     for interval in intervals:
@@ -565,50 +707,57 @@ def save_articles(articles):
             new_articles = df
         
         if not new_articles.empty:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(articles)")
-            db_columns = [row[1] for row in cursor.fetchall()]
-            
-            save_columns = [col for col in new_articles.columns if col in db_columns]
-            if save_columns:
-                new_articles[save_columns].to_sql("articles", conn, if_exists="append", index=False)
-                logger.info(f"Added {len(new_articles)} new articles to database")
-            else:
-                logger.error("No matching columns found")
+            # Fill NaN values with appropriate defaults
+            new_articles = new_articles.fillna({
+                'text': '',
+                'tokens': '',
+                'mentions': '',
+                'pos_keywords': '',
+                'neg_keywords': '',
+                'total_keywords': 0,
+                'sentiment_score': 0,
+                'sentiment_dynamic': 0.0,
+                'sentiment_ml': 0.0,
+                'sentiment_keyword': 0.0,
+                'sentiment_combined': 0.0,
+                'prediction_confidence': 0.0
+            })
+
+            new_articles.to_sql("articles", conn, if_exists="append", index=False)
+            logger.info(f"Inserted {len(new_articles)} new articles into the database")
         else:
-            logger.info("No new articles to add")
-            
+            logger.info("No new articles to insert")
+
     except Exception as e:
-        logger.error(f"Database save failed: {e}")
+        logger.error(f"Error saving articles to database: {e}")
     finally:
         conn.close()
 
-def main():
-    logger.info("Starting financial news scraper")
-    
+if __name__ == "__main__":
+    logger.info("Starting News Sentiment Analysis Pipeline")
+
     init_database()
     processor = NewsProcessor()
-    
-    try:
-        df = pd.read_csv(CONFIG['CSV_INPUT'])
-        tickers = df["Ticker"].dropna().str.upper().unique()[:CONFIG['MAX_TICKERS']]
-        logger.info(f"Processing {len(tickers)} tickers")
-    except Exception as e:
-        logger.error(f"Failed to read {CONFIG['CSV_INPUT']}: {e}")
-        return
-    
+
+    # filtered_tickers will be alphabetically sorted inside filter_tickers_with_news
+    filtered_tickers = processor.filter_tickers_with_news(processor.valid_tickers)
+
+    start = CONFIG['BATCH_START']
+    end = start + CONFIG['BATCH_SIZE']
+    batch_tickers = filtered_tickers[start:end]
+
+    logger.info(f"Processing tickers {start} to {end}: {batch_tickers}")
+
     all_articles = []
-    for ticker in tickers:
-        logger.info(f"Processing: {ticker}")
+    for ticker in batch_tickers:
         try:
             articles = processor.fetch_finviz_news(ticker)
             all_articles.extend(articles)
             sleep(random.uniform(1, 3))
         except Exception as e:
-            logger.error(f"Failed to process {ticker}: {e}")
-    
-    save_articles(all_articles)
-    logger.info("Scraper completed successfully")
+            logger.error(f"Failed to process ticker {ticker}: {e}")
 
-if __name__ == "__main__":
-    main()
+    save_articles(all_articles)
+    logger.info("Pipeline execution complete.")
+
+

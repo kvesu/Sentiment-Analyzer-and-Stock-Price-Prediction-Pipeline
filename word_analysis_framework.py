@@ -1,493 +1,621 @@
 import pandas as pd
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
-import yfinance as yf
-from datetime import datetime, timedelta
-import re
-import logging
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from collections import defaultdict, Counter
 import json
-import time
-from typing import Dict, List, Tuple, Optional
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+import yfinance as yf
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-class NewsAnalysisFramework:
-    """Complete news sentiment analysis framework following the flowchart"""
+class DynamicSentimentLearner:
+    def __init__(self):
+        self.word_performance = defaultdict(lambda: {'positive_outcomes': 0, 'negative_outcomes': 0, 'total': 0})
+        self.bigram_performance = defaultdict(lambda: {'positive_outcomes': 0, 'negative_outcomes': 0, 'total': 0})
+        self.sentiment_model = None
+        self.vectorizer = None
+        self.logger = logging.getLogger(__name__)
+        self.sentiment_weights = {}
     
-    def __init__(self, historical_mode=True, sentiment_keywords_csv: str = "sentiment_keywords.csv"):
-        self.historical_mode = historical_mode
-        self.sentiment_dictionary = {}
-        self.positive_keywords = ['bullish', 'surge', 'rally', 'gain', 'profit', 'growth', 'strong', 'beat', 'positive', 'up']
-        self.negative_keywords = ['bearish', 'crash', 'decline', 'loss', 'weak', 'miss', 'negative', 'down', 'fall', 'drop']
-        self.load_sentiment_keywords(sentiment_keywords_csv)
-        self.results_df = pd.DataFrame()
-        
-    def load_sentiment_keywords(self, csv_path: str):
-        """Load sentiment keywords from a CSV file."""
+    def load_sentiment_keywords_from_csv(self, csv_path="sentiment_keywords.csv"):
+        """Load basic sentiment keywords from a CSV file and convert them into weighted entries"""
         try:
             df = pd.read_csv(csv_path)
-            new_positive = []
-            new_negative = []
-            
-            if 'keyword' in df.columns and 'sentiment' in df.columns:
-                for index, row in df.iterrows():
-                    keyword = str(row['keyword']).strip().lower()
-                    sentiment = str(row['sentiment']).strip().lower()
-                    
-                    if sentiment == 'positive':
-                        new_positive.append(keyword)
-                    elif sentiment == 'negative':
-                        new_negative.append(keyword)
-                
-                if new_positive:
-                    self.positive_keywords = list(set(self.positive_keywords + new_positive))
-                    logger.info(f"Loaded {len(new_positive)} positive keywords from {csv_path}")
-                if new_negative:
-                    self.negative_keywords = list(set(self.negative_keywords + new_negative))
-                    logger.info(f"Loaded {len(new_negative)} negative keywords from {csv_path}")
-            else:
-                logger.warning(f"CSV '{csv_path}' must contain 'keyword' and 'sentiment' columns. Using default keywords.")
-        except FileNotFoundError:
-            logger.warning(f"Sentiment keywords CSV '{csv_path}' not found. Using default keywords.")
-        except Exception as e:
-            logger.error(f"Error loading sentiment keywords from '{csv_path}': {e}. Using default keywords.")
-
-    def load_ticker_list(self, csv_path: str) -> List[str]:
-        """Load ticker list from CSV file"""
-        try:
-            df = pd.read_csv(csv_path)
-            ticker_col = None
-            for col in ['ticker', 'symbol', 'stock', 'Ticker', 'Symbol']:
-                if col in df.columns:
-                    ticker_col = col
-                    break
-            
-            if ticker_col:
-                tickers = df[ticker_col].dropna().tolist()
-                logger.info(f"Loaded {len(tickers)} tickers from CSV")
-                return tickers
-            else:
-                logger.error("No ticker column found in CSV")
-                return []
-        except Exception as e:
-            logger.error(f"Error loading ticker CSV: {e}")
-            return []
-    
-    def fetch_news_articles(self, ticker: str) -> List[Dict]:
-        """Fetch news articles from Finviz (historical mode) or real-time source"""
-        articles = []
-        try:
-            if self.historical_mode:
-                url = f"https://finviz.com/quote.ashx?t={ticker}"
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                
-                response = requests.get(url, headers=headers)
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                news_table = soup.find('table', {'class': 'fullview-news-outer'})
-                if news_table:
-                    for row in news_table.find_all('tr'):
-                        cols = row.find_all('td')
-                        if len(cols) >= 2:
-                            date_cell = cols[0]
-                            news_cell = cols[1]
-                            
-                            date_text = date_cell.get_text().strip()
-                            
-                            link = news_cell.find('a')
-                            if link:
-                                headline = link.get_text().strip()
-                                article_url = link.get('href')
-                                
-                                articles.append({
-                                    'headline': headline,
-                                    'url': article_url,
-                                    'date': date_text,
-                                    'ticker': ticker
-                                })
-            else:
-                logger.info(f"Real-time mode not fully implemented for {ticker}")
-                
-        except Exception as e:
-            logger.error(f"Error fetching news for {ticker}: {e}")
-            
-        return articles
-    
-    def filter_recent_articles(self, articles: List[Dict], days: int = 7) -> List[Dict]:
-        """Filter articles to last N days"""
-        cutoff_date = datetime.now() - timedelta(days=days)
-        filtered = []
-        
-        for article in articles:
-            filtered.append(article)
-            
-        logger.info(f"Filtered to {len(filtered)} recent articles (Note: Full date parsing for filtering not implemented)")
-        return filtered
-    
-    def extract_article_text(self, url: str) -> Optional[str]:
-        """Extract article text using requests + BeautifulSoup"""
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            for script in soup(["script", "style"]):
-                script.extract()
-            
-            paragraphs = soup.find_all('p')
-            text = ' '.join([p.get_text() for p in paragraphs])
-            
-            if len(text) > 100:
-                return text
-            else:
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network or HTTP error extracting text from {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Error extracting text from {url}: {e}")
-            return None
-    
-    def preprocess_text(self, text: str) -> List[str]:
-        """Clean, tokenize, and normalize text"""
-        if not text:
-            return []
-        
-        text = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
-        words = [word.strip() for word in text.split() if len(word.strip()) > 2]
-        return words
-    
-    def check_ticker_mention(self, text: str, ticker: str) -> bool:
-        """Check if ticker is mentioned in text"""
-        if not text or not ticker:
-            return False
-        patterns = [
-            re.escape(ticker.lower()),
-            re.escape(ticker.lower()) + r'\s',
-            r'\$' + re.escape(ticker.upper()),
-            r'\b' + re.escape(ticker.upper()) + r'\b'
-        ]
-        return any(re.search(pattern, text.lower()) for pattern in patterns)
-    
-    def get_stock_prices(self, ticker: str, article_date: datetime) -> Dict:
-        """Get historical stock prices from Yahoo Finance"""
-        try:
-            stock = yf.Ticker(ticker)
-
-            # Fetch a wide enough range to include baseline to EOW
-            start_date = article_date - timedelta(days=1)
-            end_date = article_date + timedelta(days=7)
-            hist = stock.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
-
-            if hist.empty:
-                logger.warning(f"No historical data found for {ticker} between {start_date.strftime('%Y-%m-%d')} and {end_date.strftime('%Y-%m-%d')}")
-                return {}
-
-            prices = {
-                'baseline': None,
-                '1h_after': None,
-                '4h_after': None,
-                'eod': None,
-                'eow': None
-            }
-
-            # Get the baseline price (closing price of article date or next available)
-            article_day = article_date.date()
-            baseline_row = hist[hist.index.date == article_day]
-            if not baseline_row.empty:
-                prices['baseline'] = baseline_row['Close'].iloc[0]
-            else:
-                future_data = hist[hist.index.date > article_day]
-                if not future_data.empty:
-                    prices['baseline'] = future_data['Close'].iloc[0]
-                    logger.info(f"Baseline for {ticker} taken from next trading day after {article_day}")
+            for _, row in df.iterrows():
+                keyword = str(row["keyword"]).lower().strip()
+                sentiment = str(row["sentiment"]).lower().strip()
+                if sentiment == "positive":
+                    weight = 1.0
+                elif sentiment == "negative":
+                    weight = -1.0
                 else:
-                    logger.warning(f"Could not establish a baseline price for {ticker} on or after {article_day}")
-                    return {}
-
-            # Set EOD price (closing price of the same day if available)
-            if not baseline_row.empty:
-                prices['eod'] = baseline_row['Close'].iloc[0]
-            else:
-                prices['eod'] = prices['baseline']
-
-            # Approximate intraday prices: use next day's close for "1h_after" and "4h_after"
-            intraday_candidates = hist[hist.index.date > article_day]
-            if not intraday_candidates.empty:
-                prices['1h_after'] = intraday_candidates['Close'].iloc[0]
-                if len(intraday_candidates) >= 2:
-                    prices['4h_after'] = intraday_candidates['Close'].iloc[1]
-                else:
-                    prices['4h_after'] = intraday_candidates['Close'].iloc[0]  # fallback to same as 1h
-            else:
-                logger.warning(f"No intraday/following data available for {ticker} to estimate 1h/4h after.")
-
-            # Get EOW price (Friday or latest price in 5 trading days)
-            hist_dates = hist.index.date
-            if article_day in hist_dates:
-                baseline_idx = list(hist_dates).index(article_day)
-            else:
-                baseline_idx = 0  # fallback
-
-            eow_idx = min(baseline_idx + 5, len(hist) - 1)
-            prices['eow'] = hist['Close'].iloc[eow_idx]
-
-            return {k: v for k, v in prices.items() if v is not None}
-
+                    continue
+                self.sentiment_weights[keyword] = {
+                    "weight": weight,
+                    "confidence": 1.0,
+                    "type": "word",
+                    "occurrences": 1
+                }
+            self.logger.info(f"Loaded {len(self.sentiment_weights)} keywords from CSV")
         except Exception as e:
-            logger.error(f"Error getting prices for {ticker}: {e}")
-            return {}
+            self.logger.warning(f"Failed to load sentiment keywords from CSV: {e}")
+    
+    def analyze_historical_performance(self, articles_df):
+        """Analyze historical performance of words and bigrams"""
+        results = {}
+        
+        # Load sentiment weights from CSV first
+        self.load_sentiment_keywords_from_csv("sentiment_keywords.csv")
 
-    def calculate_price_changes(self, prices: Dict) -> Dict:
-        """Calculate percentage changes for each interval"""
-        changes = {}
-        baseline = prices.get('baseline')
-        
-        if not baseline:
-            return changes
-        
-        for interval, price in prices.items():
-            if interval != 'baseline' and price is not None:
-                pct_change = ((price - baseline) / baseline) * 100
-                changes[f'pct_change_{interval}'] = round(pct_change, 4)
-        
-        return changes
-    
-    def scan_keywords(self, words: List[str]) -> Dict:
-        """Scan for positive and negative keywords"""
-        pos_found = [word for word in words if word in self.positive_keywords]
-        neg_found = [word for word in words if word in self.negative_keywords]
-        
-        return {
-            'positive_keywords': pos_found,
-            'negative_keywords': neg_found,
-            'pos_count': len(pos_found),
-            'neg_count': len(neg_found)
-        }
-    
-    def update_sentiment_dictionary(self, words: List[str], price_direction: int):
-        """Dynamic learning module - update word sentiment scores"""
-        for word in words:
-            if word not in self.sentiment_dictionary:
-                self.sentiment_dictionary[word] = {
-                    'pos_count': 0,
-                    'neg_count': 0,
-                    'total_count': 0,
-                    'sentiment_score': 0.0
-                }
-                
-            self.sentiment_dictionary[word]['total_count'] += 1
-            
-            if price_direction > 0:
-                self.sentiment_dictionary[word]['pos_count'] += 1
-            elif price_direction < 0:
-                self.sentiment_dictionary[word]['neg_count'] += 1
-            
-            pos = self.sentiment_dictionary[word]['pos_count']
-            neg = self.sentiment_dictionary[word]['neg_count']
-            total = self.sentiment_dictionary[word]['total_count']
-            
-            if total > 0:
-                sentiment_score = (pos - neg) / total
-                self.sentiment_dictionary[word]['sentiment_score'] = sentiment_score
-    
-    def calculate_article_sentiment(self, words: List[str]) -> float:
-        """Calculate overall article sentiment score"""
-        if not words:
-            return 0.0
-        
-        total_score = 0
-        scored_words = 0
-        
-        for word in words:
-            if word in self.sentiment_dictionary:
-                score = self.sentiment_dictionary[word].get('sentiment_score', 0)
-                total_score += score
-                scored_words += 1
-        
-        return total_score / max(scored_words, 1)
-    
-    def parse_finviz_date(self, date_str: str, current_year: int) -> Optional[datetime]:
-        """
-        Parses a date string from Finviz.
-        Assumes the current year for dates that don't specify a year.
-        """
-        date_str = date_str.strip()
-        now = datetime.now()
-        
-        if "Today" in date_str:
-            time_part = date_str.split(' ')[1]
-            try:
-                return datetime.strptime(f"{now.strftime('%Y-%m-%d')} {time_part}", "%Y-%m-%d %I:%M%p")
-            except ValueError:
-                return now.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif "Yesterday" in date_str:
-            yesterday = now - timedelta(days=1)
-            time_part = date_str.split(' ')[1]
-            try:
-                return datetime.strptime(f"{yesterday.strftime('%Y-%m-%d')} {time_part}", "%Y-%m-%d %I:%M%p")
-            except ValueError:
-                return yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            try:
-                return datetime.strptime(date_str, "%b-%d-%y %I:%M%p")
-            except ValueError:
-                try:
-                    full_date_str = f"{date_str} {current_year}"
-                    return datetime.strptime(full_date_str, "%b %d %I:%M%p %Y")
-                except ValueError:
-                    logger.warning(f"Could not parse date string: '{date_str}'")
-                    return None
+        # Filter articles with valid price data
+        valid_articles = articles_df.dropna(subset=['pct_change_eod', 'tokens'])
 
-    def process_ticker(self, ticker: str) -> pd.DataFrame:
-        """Process all articles for a single ticker"""
-        logger.info(f"Processing ticker: {ticker}")
-        
-        articles = self.fetch_news_articles(ticker)
-        if not articles:
-            logger.warning(f"No articles found for {ticker}")
-            return pd.DataFrame()
-        
-        articles = self.filter_recent_articles(articles)
-        
-        ticker_results = []
-        current_year = datetime.now().year
-        
-        for article in articles:
-            try:
-                headline = article.get('headline', '')
-                url = article.get('url', '')
-                date_str = article.get('date', '')
-                
-                article_datetime = self.parse_finviz_date(date_str, current_year)
-                if not article_datetime:
-                    logger.warning(f"Skipping article due to unparsable date: {date_str} - {headline[:50]}")
-                    continue
+        if len(valid_articles) < 10:
+            self.logger.warning("Insufficient data for sentiment analysis")
+            results['sentiment_weights'] = self.sentiment_weights
+            return results
 
-                article_text = self.extract_article_text(url)
-                if not article_text:
-                    logger.warning(f"Could not extract text from {url} for headline: {headline[:50]}...")
-                    continue
-                
-                words = self.preprocess_text(article_text)
-                if not words:
-                    logger.warning(f"No meaningful words extracted from {url}")
-                    continue
-                
-                ticker_found = self.check_ticker_mention(article_text, ticker)
-                
-                prices = self.get_stock_prices(ticker, article_datetime)
-                
-                price_changes = self.calculate_price_changes(prices)
-                
-                eod_change = price_changes.get('pct_change_eod', 0)
-                price_direction = 1 if eod_change > 0 else -1 if eod_change < 0 else 0
-                
-                keyword_analysis = self.scan_keywords(words)
-                
-                self.update_sentiment_dictionary(words, price_direction)
-                
-                sentiment_score = self.calculate_article_sentiment(words)
-                
-                result = {
-                    'date': article_datetime.strftime('%Y-%m-%d %H:%M'),
-                    'ticker': ticker,
-                    'headline': headline,
-                    'url': url,
-                    'text': article_text[:500] + '...' if len(article_text) > 500 else article_text,
-                    'sentiment_score': round(sentiment_score, 4),
-                    'ticker_found': ticker_found,
-                    'pos_keywords_found': keyword_analysis['pos_count'],
-                    'neg_keywords_found': keyword_analysis['neg_count'],
-                    **price_changes,
-                    'price_direction': price_direction
-                }
-                
-                ticker_results.append(result)
-                
-                logger.info(f"Processed: {headline[:50]}... | Sentiment: {sentiment_score:.3f} | Price Change (EOD): {eod_change:+.2f}%")
-                
-                time.sleep(1)
-                
-            except Exception as e:
-                logger.error(f"Error processing article '{article.get('headline', 'N/A')}' for {ticker}: {e}")
+        # Analyze performance based on article data
+        word_stats = self._analyze_word_performance(valid_articles)
+        bigram_stats = self._analyze_bigram_performance(valid_articles)
+
+        results['word_analysis'] = word_stats
+        results['bigram_analysis'] = bigram_stats
+
+        # Merge dynamically generated sentiment weights
+        dynamic_weights = self._generate_sentiment_weights(word_stats, bigram_stats)
+
+        # Merge CSV weights and dynamic weights (give priority to dynamic if overlap)
+        merged_weights = {**self.sentiment_weights, **dynamic_weights}
+        self.sentiment_weights = merged_weights
+        results['sentiment_weights'] = merged_weights
+
+        # Train ML model
+        model_performance = self._train_sentiment_model(valid_articles)
+        results['model_performance'] = model_performance
+
+        return results
+
+    def _analyze_word_performance(self, articles_df):
+        """Analyze individual word performance"""
+        word_stats = {}
+        
+        for _, article in articles_df.iterrows():
+            # Handle different token formats
+            if isinstance(article['tokens'], str):
+                words = article['tokens'].split()
+            elif isinstance(article['tokens'], list):
+                words = article['tokens']
+            else:
                 continue
+                
+            price_change = article['pct_change_eod']
+            
+            # Define positive/negative outcomes
+            is_positive_outcome = price_change > 0
+            
+            for word in set(words):  # Use set to avoid double counting
+                word = word.lower().strip()
+                if len(word) < 3:  # Skip very short words
+                    continue
+                    
+                if word not in word_stats:
+                    word_stats[word] = {
+                        'positive_outcomes': 0,
+                        'negative_outcomes': 0,
+                        'total_occurrences': 0,
+                        'avg_price_change': 0,
+                        'price_changes': []
+                    }
+                
+                word_stats[word]['total_occurrences'] += 1
+                word_stats[word]['price_changes'].append(price_change)
+                
+                if is_positive_outcome:
+                    word_stats[word]['positive_outcomes'] += 1
+                else:
+                    word_stats[word]['negative_outcomes'] += 1
         
-        return pd.DataFrame(ticker_results)
-    
-    def run_analysis(self) -> pd.DataFrame:
-        """Run complete analysis using hardcoded 'finviz.csv' as ticker source"""
-        ticker_csv_path = "finviz.csv"  # only finviz.csv is used here
-        logger.info(f"Loading tickers from {ticker_csv_path}")
+        # Calculate statistics
+        for word, stats in word_stats.items():
+            if stats['total_occurrences'] >= 3:  # Minimum occurrence threshold
+                stats['avg_price_change'] = np.mean(stats['price_changes'])
+                stats['positive_ratio'] = stats['positive_outcomes'] / stats['total_occurrences']
+                stats['predictive_power'] = abs(stats['positive_ratio'] - 0.5) * 2  # 0-1 scale
+                stats['confidence'] = min(stats['total_occurrences'] / 10, 1.0)  # Confidence based on frequency
         
-        tickers = self.load_ticker_list(ticker_csv_path)
-        if not tickers:
-            logger.error("No tickers loaded")
-            return pd.DataFrame()
-        
-        all_results = []
-        
-        for ticker in tickers:
-            ticker_df = self.process_ticker(ticker)
-            if not ticker_df.empty:
-                all_results.append(ticker_df)
-        
-        if all_results:
-            self.results_df = pd.concat(all_results, ignore_index=True)
-            logger.info(f"Analysis complete. Processed {len(self.results_df)} articles across {len(tickers)} tickers")
-        else:
-            logger.warning("No results generated")
-            self.results_df = pd.DataFrame()
-        
-        return self.results_df
-
-
-    def save_results(self, csv_path: str = "news_analysis_results.csv"):
-        """Save combined results to CSV"""
-        if not self.results_df.empty:
-            self.results_df.to_csv(csv_path, index=False)
-            logger.info(f"Results saved to {csv_path}")
-        
-        dict_path = "sentiment_dictionary.json"
-        with open(dict_path, 'w') as f:
-            json.dump(self.sentiment_dictionary, f, indent=2)
-        logger.info(f"Sentiment dictionary saved to {dict_path}")
-    
-    def generate_summary(self) -> Dict:
-        """Generate cross-ticker analysis and summary"""
-        if self.results_df.empty:
-            return {}
-        
-        summary = {
-            'total_articles': len(self.results_df),
-            'tickers_analyzed': self.results_df['ticker'].nunique(),
-            'avg_sentiment': self.results_df['sentiment_score'].mean(),
-            'positive_articles': len(self.results_df[self.results_df['sentiment_score'] > 0]),
-            'negative_articles': len(self.results_df[self.results_df['sentiment_score'] < 0]),
-            'avg_price_change_eod': self.results_df['pct_change_eod'].mean() if 'pct_change_eod' in self.results_df.columns else 0
+        # Filter and sort by predictive power
+        filtered_stats = {
+            word: stats for word, stats in word_stats.items() 
+            if stats['total_occurrences'] >= 3
         }
         
-        logger.info("Summary generated")
-        return summary
+        return dict(sorted(filtered_stats.items(), 
+                          key=lambda x: x[1]['predictive_power'], reverse=True))
+    
+    def _analyze_bigram_performance(self, articles_df):
+        """Analyze bigram performance"""
+        bigram_stats = {}
+        
+        for _, article in articles_df.iterrows():
+            # Handle different token formats
+            if isinstance(article['tokens'], str):
+                words = article['tokens'].split()
+            elif isinstance(article['tokens'], list):
+                words = article['tokens']
+            else:
+                continue
+                
+            words = [w.lower().strip() for w in words if len(w) >= 3]
+            price_change = article['pct_change_eod']
+            is_positive_outcome = price_change > 0
+            
+            # Generate bigrams
+            for i in range(len(words) - 1):
+                bigram = f"{words[i]} {words[i+1]}"
+                
+                if bigram not in bigram_stats:
+                    bigram_stats[bigram] = {
+                        'positive_outcomes': 0,
+                        'negative_outcomes': 0,
+                        'total_occurrences': 0,
+                        'price_changes': []
+                    }
+                
+                bigram_stats[bigram]['total_occurrences'] += 1
+                bigram_stats[bigram]['price_changes'].append(price_change)
+                
+                if is_positive_outcome:
+                    bigram_stats[bigram]['positive_outcomes'] += 1
+                else:
+                    bigram_stats[bigram]['negative_outcomes'] += 1
+        
+        # Calculate statistics for bigrams
+        for bigram, stats in bigram_stats.items():
+            if stats['total_occurrences'] >= 2:  # Lower threshold for bigrams
+                stats['avg_price_change'] = np.mean(stats['price_changes'])
+                stats['positive_ratio'] = stats['positive_outcomes'] / stats['total_occurrences']
+                stats['predictive_power'] = abs(stats['positive_ratio'] - 0.5) * 2
+                stats['confidence'] = min(stats['total_occurrences'] / 5, 1.0)
+        
+        return {k: v for k, v in bigram_stats.items() if v['total_occurrences'] >= 2}
+    
+    def _generate_sentiment_weights(self, word_stats, bigram_stats):
+        """Generate sentiment weights for words and bigrams"""
+        sentiment_weights = {}
+        
+        # Process words
+        for word, stats in word_stats.items():
+            if stats['total_occurrences'] >= 3:
+                # Weight based on average price change and predictive power
+                weight = stats['avg_price_change'] * stats['predictive_power']
+                sentiment_weights[word] = {
+                    'weight': weight,
+                    'confidence': stats['confidence'],
+                    'type': 'word',
+                    'occurrences': stats['total_occurrences']
+                }
+        
+        # Process bigrams
+        for bigram, stats in bigram_stats.items():
+            if stats['total_occurrences'] >= 2:
+                weight = stats['avg_price_change'] * stats['predictive_power']
+                sentiment_weights[bigram] = {
+                    'weight': weight,
+                    'confidence': stats['confidence'],
+                    'type': 'bigram',
+                    'occurrences': stats['total_occurrences']
+                }
+        
+        return sentiment_weights
+    
+    def _train_sentiment_model(self, articles_df):
+        """Train a machine learning model for sentiment prediction"""
+        try:
+            # Prepare data
+            X = []
+            y = []
+            
+            for _, article in articles_df.iterrows():
+                if isinstance(article['tokens'], str):
+                    X.append(article['tokens'])
+                elif isinstance(article['tokens'], list):
+                    X.append(' '.join(article['tokens']))
+                else:
+                    continue
+                    
+                y.append(1 if article['pct_change_eod'] > 0 else 0)
+            
+            X = np.array(X)
+            y = np.array(y)
+            
+            # Check for sufficient data
+            if len(X) < 10:
+                return {'model_trained': False, 'error': 'Insufficient data'}
+            
+            # Check if we have both classes
+            if len(np.unique(y)) < 2:
+                return {'model_trained': False, 'error': 'Need both positive and negative examples'}
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+            
+            # Vectorize text
+            self.vectorizer = TfidfVectorizer(
+                max_features=1000,
+                ngram_range=(1, 2),
+                stop_words='english',
+                min_df=2
+            )
+            
+            X_train_vec = self.vectorizer.fit_transform(X_train)
+            X_test_vec = self.vectorizer.transform(X_test)
+            
+            # Train model
+            self.sentiment_model = LogisticRegression(random_state=42, max_iter=1000)
+            self.sentiment_model.fit(X_train_vec, y_train)
+            
+            # Evaluate
+            train_score = self.sentiment_model.score(X_train_vec, y_train)
+            test_score = self.sentiment_model.score(X_test_vec, y_test)
+            
+            return {
+                'train_accuracy': train_score,
+                'test_accuracy': test_score,
+                'model_trained': True,
+                'feature_count': X_train_vec.shape[1]
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Model training failed: {e}")
+            return {'model_trained': False, 'error': str(e)}
+    
+    def predict_sentiment(self, text):
+        """Predict sentiment using the trained model"""
+        if not self.sentiment_model or not self.vectorizer:
+            return 0.5  # Neutral
+        
+        try:
+            text_vec = self.vectorizer.transform([text])
+            probability = self.sentiment_model.predict_proba(text_vec)[0][1]  # Probability of positive
+            return probability
+        except Exception as e:
+            self.logger.error(f"Sentiment prediction failed: {e}")
+            return 0.5
+    
+    def save_analysis_results(self, results, filename="word_analysis_results.json"):
+        """Save analysis results to JSON file"""
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_numpy(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+        
+        # Deep convert all numpy types
+        def deep_convert(obj):
+            if isinstance(obj, dict):
+                return {k: deep_convert(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [deep_convert(v) for v in obj]
+            else:
+                return convert_numpy(obj)
+        
+        converted_results = deep_convert(results)
+        
+        with open(filename, 'w') as f:
+            json.dump(converted_results, f, indent=2)
+        
+        self.logger.info(f"Analysis results saved to {filename}")
+
+
+class NewsProcessor:
+    """Base NewsProcessor class"""
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def extract_mentions_and_sentiment(self, article_text, ticker):
+        """Basic implementation - replace with your actual method"""
+        # This is a placeholder - implement your actual logic
+        words = article_text.lower().split()
+        mentions = [ticker.lower()]
+        
+        # Simple positive/negative word lists
+        positive_words = ['growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong']
+        negative_words = ['loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak']
+        
+        pos_kw = [word for word in words if word in positive_words]
+        neg_kw = [word for word in words if word in negative_words]
+        
+        return mentions, pos_kw, neg_kw, ' '.join(words)
+    
+    def get_price_data(self, ticker, parsed_dt):
+        """Get price data for the ticker around the given datetime"""
+        try:
+            # This is a simplified version - implement your actual price data logic
+            stock = yf.Ticker(ticker)
+            
+            # Get data for a few days around the article date
+            start_date = parsed_dt - timedelta(days=1)
+            end_date = parsed_dt + timedelta(days=7)
+            
+            hist = stock.history(start=start_date, end=end_date)
+            
+            if hist.empty:
+                return None
+            
+            # Calculate price changes at different intervals
+            base_price = hist['Close'].iloc[0]
+            
+            price_data = {}
+            
+            # End of day change
+            if len(hist) > 1:
+                eod_price = hist['Close'].iloc[1]
+                price_data['pct_change_eod'] = (eod_price - base_price) / base_price * 100
+            
+            # End of week change
+            if len(hist) > 5:
+                eow_price = hist['Close'].iloc[5]
+                price_data['pct_change_eow'] = (eow_price - base_price) / base_price * 100
+            
+            return price_data
+            
+        except Exception as e:
+            self.logger.error(f"Error getting price data for {ticker}: {e}")
+            return None
+    
+    def calculate_dynamic_sentiment(self, text):
+        """Calculate sentiment using dynamic weights - implement your actual method"""
+        # Placeholder implementation
+        words = text.lower().split()
+        positive_words = ['growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong']
+        negative_words = ['loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak']
+        
+        pos_score = sum(1 for word in words if word in positive_words)
+        neg_score = sum(1 for word in words if word in negative_words)
+        
+        if pos_score + neg_score == 0:
+            return 0
+        
+        return (pos_score - neg_score) / (pos_score + neg_score)
+
+
+class EnhancedNewsProcessor(NewsProcessor):
+    def __init__(self):
+        super().__init__()
+        self.sentiment_learner = None
+        self.sentiment_weights = {}
+        self.load_sentiment_learner()
+    
+    def load_sentiment_learner(self):
+        """Load the trained sentiment learner"""
+        try:
+            self.sentiment_learner = DynamicSentimentLearner()
+            
+            # Load existing analysis results if available
+            try:
+                with open("word_analysis_results.json", 'r') as f:
+                    results = json.load(f)
+                    self.sentiment_weights = results.get('sentiment_weights', {})
+                    self.logger.info("Loaded existing sentiment analysis results")
+            except FileNotFoundError:
+                self.sentiment_weights = {}
+                self.logger.info("No existing sentiment analysis results found")
+                
+        except Exception as e:
+            self.logger.warning(f"Sentiment learner not available: {e}")
+            self.sentiment_learner = None
+    
+    def calculate_enhanced_sentiment(self, text):
+        """Calculate sentiment using multiple methods"""
+        sentiment_scores = {}
+        
+        # Method 1: Dynamic weights (existing)
+        sentiment_scores['dynamic_weights'] = self.calculate_dynamic_sentiment(text)
+        
+        # Method 2: ML model prediction
+        if self.sentiment_learner:
+            sentiment_scores['ml_prediction'] = self.sentiment_learner.predict_sentiment(text)
+        else:
+            sentiment_scores['ml_prediction'] = None
+        
+        # Method 3: Keyword-based scoring
+        sentiment_scores['keyword_based'] = self.calculate_keyword_sentiment(text)
+        
+        # Method 4: Weighted combination
+        sentiment_scores['combined'] = self.combine_sentiment_scores(sentiment_scores)
+        
+        return sentiment_scores
+    
+    def calculate_keyword_sentiment(self, text):
+        """Calculate sentiment based on keyword matching"""
+        if not self.sentiment_weights:
+            return 0
+        
+        words = text.lower().split()
+        positive_score = 0
+        negative_score = 0
+        total_weight = 0
+        
+        # Check individual words
+        for word in words:
+            if word in self.sentiment_weights:
+                weight = self.sentiment_weights[word]['weight']
+                confidence = self.sentiment_weights[word]['confidence']
+                
+                if weight > 0:
+                    positive_score += weight * confidence
+                else:
+                    negative_score += abs(weight) * confidence
+                
+                total_weight += confidence
+        
+        # Check bigrams
+        for i in range(len(words) - 1):
+            bigram = f"{words[i]} {words[i+1]}"
+            if bigram in self.sentiment_weights:
+                weight = self.sentiment_weights[bigram]['weight']
+                confidence = self.sentiment_weights[bigram]['confidence']
+                
+                if weight > 0:
+                    positive_score += weight * confidence * 1.2  # Boost bigrams
+                else:
+                    negative_score += abs(weight) * confidence * 1.2
+                
+                total_weight += confidence
+        
+        if total_weight == 0:
+            return 0
+        
+        # Return normalized score (-1 to 1)
+        net_score = (positive_score - negative_score) / total_weight
+        return max(-1, min(1, net_score))
+    
+    def combine_sentiment_scores(self, sentiment_scores):
+        """Combine multiple sentiment scores with weights"""
+        weights = {
+            'dynamic_weights': 0.3,
+            'ml_prediction': 0.4,
+            'keyword_based': 0.3
+        }
+        
+        combined_score = 0
+        total_weight = 0
+        
+        for method, score in sentiment_scores.items():
+            if method in weights and score is not None:
+                weight = weights[method]
+                combined_score += score * weight
+                total_weight += weight
+        
+        if total_weight == 0:
+            return 0
+        
+        return combined_score / total_weight
+    
+    def enhanced_article_processing(self, article_text, headline, ticker, parsed_dt):
+        """Process article with enhanced sentiment analysis"""
+        # Extract mentions and basic sentiment
+        mentions, pos_kw, neg_kw, tokens = self.extract_mentions_and_sentiment(article_text, ticker)
+        
+        # Calculate enhanced sentiment
+        full_text = f"{headline} {article_text}"
+        sentiment_scores = self.calculate_enhanced_sentiment(full_text)
+        
+        # Get price data
+        price_data = self.get_price_data(ticker, parsed_dt)
+        
+        # Create enhanced article entry
+        article_entry = {
+            "ticker": ticker,
+            "headline": headline,
+            "text": article_text,
+            "tokens": tokens,
+            "mentions": ", ".join(mentions),
+            "pos_keywords": ", ".join(pos_kw),
+            "neg_keywords": ", ".join(neg_kw),
+            "total_keywords": len(pos_kw) + len(neg_kw),
+            
+            # Enhanced sentiment scores
+            "sentiment_dynamic": sentiment_scores.get('dynamic_weights', 0),
+            "sentiment_ml": sentiment_scores.get('ml_prediction', 0),
+            "sentiment_keyword": sentiment_scores.get('keyword_based', 0),
+            "sentiment_combined": sentiment_scores.get('combined', 0),
+            
+            # Traditional sentiment score for comparison
+            "sentiment_score_traditional": len(pos_kw) - len(neg_kw),
+            
+            # Prediction based on combined sentiment
+            "predicted_direction": "Positive" if sentiment_scores.get('combined', 0) > 0 else "Negative",
+            "prediction_confidence": abs(sentiment_scores.get('combined', 0))
+        }
+        
+        # Add price data if available
+        if price_data:
+            article_entry.update(price_data)
+            
+            # Calculate prediction accuracy for different sentiment methods
+            intervals = ['eod', 'eow']  # Removed 1h, 4h as they're not implemented
+            for interval in intervals:
+                pct_change_key = f'pct_change_{interval}'
+                if pct_change_key in price_data and price_data[pct_change_key] is not None:
+                    actual_positive = price_data[pct_change_key] > 0
+                    
+                    # Check accuracy for each sentiment method
+                    for method in ['dynamic', 'ml', 'keyword', 'combined']:
+                        sentiment_key = f'sentiment_{method}'
+                        if sentiment_key in article_entry and article_entry[sentiment_key] is not None:
+                            predicted_positive = article_entry[sentiment_key] > 0
+                            article_entry[f'accuracy_{method}_{interval}'] = (
+                                predicted_positive == actual_positive
+                            )
+        
+        return article_entry
+
+
+# Usage example
+def run_sentiment_analysis():
+    """Run the complete sentiment analysis pipeline"""
+    # Load existing data
+    try:
+        conn = sqlite3.connect("articles.db")
+        articles_df = pd.read_sql("SELECT * FROM articles", conn)
+        conn.close()
+        
+        if articles_df.empty:
+            print("No articles found in database")
+            return
+            
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
+    
+    # Initialize learner
+    learner = DynamicSentimentLearner()
+    
+    # Run analysis
+    print("Starting sentiment analysis...")
+    results = learner.analyze_historical_performance(articles_df)
+    
+    # Save results
+    learner.save_analysis_results(results)
+    
+    # Print summary
+    print(f"Analysis complete:")
+    print(f"- Words analyzed: {len(results['word_analysis'])}")
+    print(f"- Bigrams analyzed: {len(results['bigram_analysis'])}")
+    print(f"- Sentiment weights generated: {len(results['sentiment_weights'])}")
+    
+    if results['model_performance'].get('model_trained'):
+        print(f"- Model accuracy: {results['model_performance']['test_accuracy']:.3f}")
+    else:
+        print(f"- Model training failed: {results['model_performance'].get('error', 'Unknown error')}")
+
+
+def process_articles_with_enhanced_sentiment():
+    """Process articles using the enhanced sentiment framework"""
+    processor = EnhancedNewsProcessor()
+    
+    # Example usage:
+    # article_entry = processor.enhanced_article_processing(
+    #     article_text="Company reports strong quarterly earnings with 20% growth",
+    #     headline="Strong Q4 Results",
+    #     ticker="AAPL",
+    #     parsed_dt=datetime.now()
+    # )
+    
+    return processor
 
 if __name__ == "__main__":
-    # Initialize framework (expects existing finviz.csv and sentiment_keywords.csv files)
-    analyzer = NewsAnalysisFramework(historical_mode=True, sentiment_keywords_csv="sentiment_keywords.csv")
-
-    # Run analysis
-    results = analyzer.run_analysis()
-
-    if not results.empty:
-        analyzer.save_results()
-
-        summary = analyzer.generate_summary()
-        print("\nAnalysis Summary:")
-        for key, value in summary.items():
-            print(f"{key}: {value}")
-    else:
-        print("No results generated")
-
+    run_sentiment_analysis()
