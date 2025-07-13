@@ -14,6 +14,7 @@ from googlesearch import search
 import numpy as np
 import json
 from word_analysis_framework import DynamicSentimentLearner, EnhancedNewsProcessor
+from feature_engineering import FinancialNewsFeatureEngineer
 
 # Configuration
 CONFIG = {
@@ -214,7 +215,7 @@ class SimplifiedPriceAnalyzer:
         eow_time = article_datetime + timedelta(days=days_until_friday)
         eow_time = eow_time.replace(hour=16, minute=0, second=0, microsecond=0)
         return eow_time - article_datetime
-
+    
 class NewsProcessor:
     def __init__(self):
         self.session = self._create_session()
@@ -579,41 +580,8 @@ class NewsProcessor:
         return (is_sentiment_positive and pct_change > 0) or (not is_sentiment_positive and pct_change < 0)
     
     def filter_tickers_with_news(self, tickers):
-        tickers = sorted(tickers)  # alphabetical order
-        
-        # Load cached tickers with no news
-        no_news_cache = load_no_news_cache()
-        
-        filtered = []
-        newly_no_news = set()
-        
-        for ticker in tickers:
-            if ticker in no_news_cache:
-                logger.info(f"Ticker {ticker} skipped (cached no news)")
-                continue
-            
-            url = f"https://finviz.com/quote.ashx?t={ticker}"
-            try:
-                response = self.session.get(url, headers=self.headers, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
-                news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
-                if news_table:
-                    filtered.append(ticker)
-                else:
-                    logger.info(f"Ticker {ticker} excluded: no news table found")
-                    newly_no_news.add(ticker)
-            except Exception as e:
-                logger.warning(f"Error checking ticker {ticker}: {e}")
-            
-            sleep(random.uniform(0.5, 1.5))  # polite delay
-        
-        # Update cache file with new no-news tickers
-        updated_no_news_cache = no_news_cache.union(newly_no_news)
-        save_no_news_cache(updated_no_news_cache)
-        
-        logger.info(f"Filtered tickers count: {len(filtered)} out of {len(tickers)}")
-        return filtered
+        # Simply return the sorted tickers without checking news table
+        return sorted(tickers)
 
 def init_database():
     conn = sqlite3.connect(CONFIG['DB_PATH'])
@@ -621,7 +589,7 @@ def init_database():
     
     all_required_columns = {
         'ticker': 'TEXT', 'datetime': 'TEXT', 'headline': 'TEXT', 'url': 'TEXT UNIQUE', 'text': 'TEXT',
-        'tokens': 'TEXT', 'sentiment_score': 'INTEGER', 'pos_keywords': 'TEXT', 'neg_keywords': 'TEXT', 
+        'tokens': 'TEXT', 'sentiment_score': 'INTEGER', 'pos_keywords': 'TEXT', 'neg_keywords': 'TEXT',
         'total_keywords': 'INTEGER', 'mentions': 'TEXT', 'baseline_price': 'REAL', 'eod_price': 'REAL',
         'pct_change_eod': 'REAL', 'price_direction': 'TEXT', 'predicted_direction': 'TEXT',
         'prediction_correct': 'BOOLEAN', 'price_1h': 'REAL', 'price_4h': 'REAL', 'price_eow': 'REAL',
@@ -629,16 +597,23 @@ def init_database():
         'direction_1h': 'TEXT', 'direction_4h': 'TEXT', 'direction_eow': 'TEXT',
         'data_interval': 'TEXT', 'data_points': 'INTEGER', 'prediction_correct_1h': 'BOOLEAN',
         'prediction_correct_4h': 'BOOLEAN', 'prediction_correct_eod': 'BOOLEAN', 'prediction_correct_eow': 'BOOLEAN',
-        
+
         # Enhanced sentiment columns
         'sentiment_dynamic': 'REAL', 'sentiment_ml': 'REAL', 'sentiment_keyword': 'REAL', 'sentiment_combined': 'REAL',
         'prediction_confidence': 'REAL',
         'accuracy_dynamic_1h': 'BOOLEAN', 'accuracy_dynamic_4h': 'BOOLEAN', 'accuracy_dynamic_eod': 'BOOLEAN', 'accuracy_dynamic_eow': 'BOOLEAN',
         'accuracy_ml_1h': 'BOOLEAN', 'accuracy_ml_4h': 'BOOLEAN', 'accuracy_ml_eod': 'BOOLEAN', 'accuracy_ml_eow': 'BOOLEAN',
         'accuracy_keyword_1h': 'BOOLEAN', 'accuracy_keyword_4h': 'BOOLEAN', 'accuracy_keyword_eod': 'BOOLEAN', 'accuracy_keyword_eow': 'BOOLEAN',
-        'accuracy_combined_1h': 'BOOLEAN', 'accuracy_combined_4h': 'BOOLEAN', 'accuracy_combined_eod': 'BOOLEAN', 'accuracy_combined_eow': 'BOOLEAN'
+        'accuracy_combined_1h': 'BOOLEAN', 'accuracy_combined_4h': 'BOOLEAN', 'accuracy_combined_eod': 'BOOLEAN', 'accuracy_combined_eow': 'BOOLEAN',
+
+        # Added feature engineering columns
+        'day_of_week': 'INTEGER',
+        'hour_of_day': 'INTEGER',
+        'month': 'INTEGER',
+        'week_of_year': 'INTEGER',
+        'is_weekend': 'BOOLEAN',
     }
-    
+
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'")
     table_exists = cursor.fetchone() is not None
     
@@ -739,25 +714,37 @@ if __name__ == "__main__":
     init_database()
     processor = NewsProcessor()
 
-    # filtered_tickers will be alphabetically sorted inside filter_tickers_with_news
     filtered_tickers = processor.filter_tickers_with_news(processor.valid_tickers)
 
     start = CONFIG['BATCH_START']
     end = start + CONFIG['BATCH_SIZE']
     batch_tickers = filtered_tickers[start:end]
 
-    logger.info(f"Processing tickers {start} to {end}: {batch_tickers}")
-
-    all_articles = []
     for ticker in batch_tickers:
         try:
+            logger.info(f"Processing ticker: {ticker}")
+
             articles = processor.fetch_finviz_news(ticker)
-            all_articles.extend(articles)
-            sleep(random.uniform(1, 3))
+
+            if not articles:
+                logger.warning(f"No articles processed for {ticker}")
+                continue
+
+            df = pd.DataFrame(articles)
+
+            # Apply feature engineering
+            feature_engineer = FinancialNewsFeatureEngineer()
+            df = feature_engineer.feature_engineering_pipeline(df)
+
+            # Save the engineered articles, not the raw list
+            save_articles(df.to_dict(orient="records"))
+
         except Exception as e:
             logger.error(f"Failed to process ticker {ticker}: {e}")
+            continue
 
-    save_articles(all_articles)
-    logger.info("Pipeline execution complete.")
+    logger.info("Pipeline complete.")
+
+
 
 
