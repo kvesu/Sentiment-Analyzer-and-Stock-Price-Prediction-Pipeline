@@ -14,7 +14,7 @@ from googlesearch import search
 import numpy as np
 import json
 from word_analysis_framework import DynamicSentimentLearner, EnhancedNewsProcessor
-from feature_engineering import FinancialNewsFeatureEngineer
+from feature_engineering import feature_engineering_pipeline
 
 # Configuration
 CONFIG = {
@@ -194,11 +194,11 @@ class SimplifiedPriceAnalyzer:
         if pct_change is None:
             return "No Data"
         elif pct_change > 0:
-            return "Positive ↑"
+            return "Positive"
         elif pct_change < 0:
-            return "Negative ↓"
+            return "Negative"
         else:
-            return "Neutral →"
+            return "Neutral"
     
     def _get_end_of_day_delta(self, article_datetime):
         eod_time = article_datetime.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -515,59 +515,43 @@ class NewsProcessor:
             full_text = f"{headline} {article_text}"
             enhanced_sentiment = self.enhanced_processor.calculate_enhanced_sentiment(full_text)
             
-            # Traditional sentiment score for comparison
-            sentiment_score = len(pos_kw) - len(neg_kw)
-            
             price_data = self.get_price_data(ticker, parsed_dt)
             
+            # Article entry with tokens included
             article_entry = {
                 "ticker": ticker,
                 "datetime": cols[0].get_text(strip=True),
                 "headline": headline,
                 "url": article_url,
                 "text": article_text,
-                "tokens": tokens,
-                "sentiment_score": sentiment_score,
-                "pos_keywords": ", ".join(pos_kw),
-                "neg_keywords": ", ".join(neg_kw),
-                "total_keywords": len(pos_kw) + len(neg_kw),
-                "mentions": ", ".join(mentions),
+                "tokens": tokens,  # Add the preprocessed tokens
                 
-                # Enhanced sentiment scores
+                # Sentiment signals
                 "sentiment_dynamic": enhanced_sentiment.get('dynamic_weights', 0),
                 "sentiment_ml": enhanced_sentiment.get('ml_prediction', 0),
                 "sentiment_keyword": enhanced_sentiment.get('keyword_based', 0),
                 "sentiment_combined": enhanced_sentiment.get('combined', 0),
+                "prediction_confidence": abs(enhanced_sentiment.get('combined', 0)),
                 
-                # Prediction based on combined sentiment
-                "predicted_direction": "Positive" if enhanced_sentiment.get('combined', 0) > 0 else "Negative",
-                "prediction_confidence": abs(enhanced_sentiment.get('combined', 0))
+                # Additional extracted features
+                "mentions": ', '.join(mentions) if mentions else '',
+                "pos_keywords": ', '.join(pos_kw) if pos_kw else '',
+                "neg_keywords": ', '.join(neg_kw) if neg_kw else '',
+                "total_keywords": len(pos_kw) + len(neg_kw)
             }
             
+            # Add price data if available
             if price_data:
-                article_entry.update(price_data)
-                
-                # Check prediction accuracy for enhanced sentiment
-                is_sentiment_positive = enhanced_sentiment.get('combined', 0) > 0
-                intervals = ['1h', '4h', 'eod', 'eow']
-                
-                for interval in intervals:
-                    pct_change_key = f'pct_change_{interval}'
-                    if pct_change_key in price_data:
-                        article_entry[f'prediction_correct_{interval}'] = self._check_prediction_accuracy(
-                            is_sentiment_positive, price_data[pct_change_key]
-                        )
-                        
-                        # Also check accuracy for different sentiment methods
-                        for method in ['dynamic', 'ml', 'keyword', 'combined']:
-                            sentiment_key = f'sentiment_{method}'
-                            if sentiment_key in enhanced_sentiment and enhanced_sentiment[sentiment_key] is not None:
-                                predicted_positive = enhanced_sentiment[sentiment_key] > 0
-                                if price_data[pct_change_key] is not None:
-                                    actual_positive = price_data[pct_change_key] > 0
-                                    article_entry[f'accuracy_{method}_{interval}'] = (
-                                        predicted_positive == actual_positive
-                                    )
+                article_entry.update({
+                    'pct_change_1h': price_data.get('pct_change_1h'),
+                    'pct_change_4h': price_data.get('pct_change_4h'),
+                    'pct_change_eod': price_data.get('pct_change_eod'),
+                    'pct_change_eow': price_data.get('pct_change_eow'),
+                    'direction_1h': price_data.get('direction_1h'),
+                    'direction_4h': price_data.get('direction_4h'),
+                    'direction_eod': price_data.get('direction_eod'),
+                    'direction_eow': price_data.get('direction_eow')
+                })
             
             articles.append(article_entry)
         
@@ -580,63 +564,126 @@ class NewsProcessor:
         return (is_sentiment_positive and pct_change > 0) or (not is_sentiment_positive and pct_change < 0)
     
     def filter_tickers_with_news(self, tickers):
+        """Filter tickers that have news - simplified version"""
         # Simply return the sorted tickers without checking news table
         return sorted(tickers)
-
+    
 def init_database():
-    conn = sqlite3.connect(CONFIG['DB_PATH'])
+    """Create (or patch) a lean 'articles' table that matches the minimal feature set."""
+    conn = sqlite3.connect(CONFIG["DB_PATH"])
     cursor = conn.cursor()
-    
+
+    # ── keep only what the slim FE produces ──────────────────────────────
     all_required_columns = {
-        'ticker': 'TEXT', 'datetime': 'TEXT', 'headline': 'TEXT', 'url': 'TEXT UNIQUE', 'text': 'TEXT',
-        'tokens': 'TEXT', 'sentiment_score': 'INTEGER', 'pos_keywords': 'TEXT', 'neg_keywords': 'TEXT',
-        'total_keywords': 'INTEGER', 'mentions': 'TEXT', 'baseline_price': 'REAL', 'eod_price': 'REAL',
-        'pct_change_eod': 'REAL', 'price_direction': 'TEXT', 'predicted_direction': 'TEXT',
-        'prediction_correct': 'BOOLEAN', 'price_1h': 'REAL', 'price_4h': 'REAL', 'price_eow': 'REAL',
-        'pct_change_1h': 'REAL', 'pct_change_4h': 'REAL', 'pct_change_eow': 'REAL',
-        'direction_1h': 'TEXT', 'direction_4h': 'TEXT', 'direction_eow': 'TEXT',
-        'data_interval': 'TEXT', 'data_points': 'INTEGER', 'prediction_correct_1h': 'BOOLEAN',
-        'prediction_correct_4h': 'BOOLEAN', 'prediction_correct_eod': 'BOOLEAN', 'prediction_correct_eow': 'BOOLEAN',
+    "ticker": "TEXT",
+    "datetime": "TEXT",
+    "headline": "TEXT",
+    "url": "TEXT",
+    "text": "TEXT",
+    "tokens": "TEXT",
+    "sentiment_dynamic": "REAL",
+    "sentiment_ml": "REAL",
+    "sentiment_keyword": "REAL",
+    "sentiment_combined": "REAL",
+    "prediction_confidence": "REAL",
+    "mentions": "INTEGER",
+    "pos_keywords": "INTEGER",
+    "neg_keywords": "INTEGER",
+    "total_keywords": "INTEGER",
 
-        # Enhanced sentiment columns
-        'sentiment_dynamic': 'REAL', 'sentiment_ml': 'REAL', 'sentiment_keyword': 'REAL', 'sentiment_combined': 'REAL',
-        'prediction_confidence': 'REAL',
-        'accuracy_dynamic_1h': 'BOOLEAN', 'accuracy_dynamic_4h': 'BOOLEAN', 'accuracy_dynamic_eod': 'BOOLEAN', 'accuracy_dynamic_eow': 'BOOLEAN',
-        'accuracy_ml_1h': 'BOOLEAN', 'accuracy_ml_4h': 'BOOLEAN', 'accuracy_ml_eod': 'BOOLEAN', 'accuracy_ml_eow': 'BOOLEAN',
-        'accuracy_keyword_1h': 'BOOLEAN', 'accuracy_keyword_4h': 'BOOLEAN', 'accuracy_keyword_eod': 'BOOLEAN', 'accuracy_keyword_eow': 'BOOLEAN',
-        'accuracy_combined_1h': 'BOOLEAN', 'accuracy_combined_4h': 'BOOLEAN', 'accuracy_combined_eod': 'BOOLEAN', 'accuracy_combined_eow': 'BOOLEAN',
+    # price changes and directions
+    "pct_change_1h": "REAL",
+    "pct_change_4h": "REAL",
+    "pct_change_eod": "REAL",
+    "pct_change_eow": "REAL",
+    "direction_1h": "TEXT",
+    "direction_4h": "TEXT",
+    "direction_eod": "TEXT",
+    "direction_eow": "TEXT",
 
-        # Added feature engineering columns
-        'day_of_week': 'INTEGER',
-        'hour_of_day': 'INTEGER',
-        'month': 'INTEGER',
-        'week_of_year': 'INTEGER',
-        'is_weekend': 'BOOLEAN',
-    }
+    # time-based features
+    "day_of_week": "INTEGER",
+    "hour_of_day": "INTEGER",
+    "day_of_month": "INTEGER",
+    "month": "INTEGER",
+    "quarter": "INTEGER",
+    "year": "INTEGER",
+    "is_weekend": "BOOLEAN",
+    "is_market_hours": "BOOLEAN",
+    "is_premarket": "BOOLEAN",
+    "is_aftermarket": "BOOLEAN",
+    "is_opening_hour": "BOOLEAN",
+    "is_closing_hour": "BOOLEAN",
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'")
-    table_exists = cursor.fetchone() is not None
-    
-    if table_exists:
+    # cyclical features
+    "hour_sin": "REAL",
+    "hour_cos": "REAL",
+    "day_sin": "REAL",
+    "day_cos": "REAL",
+
+    # advanced sentiment
+    "sentiment_combined_strength": "REAL",
+    "sentiment_combined_positive": "REAL",
+    "sentiment_combined_negative": "REAL",
+    "sentiment_combined_neutral": "REAL",
+    "sentiment_combined_very_positive": "REAL",
+    "sentiment_combined_very_negative": "REAL",
+    "sentiment_combined_confidence": "REAL",
+
+    # derived movement features
+    "pct_change_1h_abs": "REAL",
+    "pct_change_1h_positive": "BOOLEAN",
+    "pct_change_1h_negative": "BOOLEAN",
+    "pct_change_1h_significant": "BOOLEAN",
+    "pct_change_4h_abs": "REAL",
+    "pct_change_4h_positive": "BOOLEAN",
+    "pct_change_4h_negative": "BOOLEAN",
+    "pct_change_4h_significant": "BOOLEAN",
+    "pct_change_eod_abs": "REAL",
+    "pct_change_eod_positive": "BOOLEAN",
+    "pct_change_eod_negative": "BOOLEAN",
+    "pct_change_eod_significant": "BOOLEAN",
+    "pct_change_eow_abs": "REAL",
+    "pct_change_eow_positive": "BOOLEAN",
+    "pct_change_eow_negative": "BOOLEAN",
+    "pct_change_eow_significant": "BOOLEAN",
+
+    # target labels
+    "target_pct_change_1h_up_0_02": "BOOLEAN",
+    "target_pct_change_1h_down_0_02": "BOOLEAN",
+    "target_pct_change_1h_direction_0_02": "TEXT",
+    "target_pct_change_4h_up_0_02": "BOOLEAN",
+    "target_pct_change_4h_down_0_02": "BOOLEAN",
+    "target_pct_change_4h_direction_0_02": "TEXT",
+    "target_pct_change_eod_up_0_02": "BOOLEAN",
+    "target_pct_change_eod_down_0_02": "BOOLEAN",
+    "target_pct_change_eod_direction_0_02": "TEXT",
+    "target_pct_change_eow_up_0_02": "BOOLEAN",
+    "target_pct_change_eow_down_0_02": "BOOLEAN",
+    "target_pct_change_eow_direction_0_02": "TEXT"
+}
+    # ─────────────────────────────────────────────────────────────────────
+
+    # does the table already exist?
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='articles'"
+    )
+    if cursor.fetchone():
+        # patch any missing columns
         cursor.execute("PRAGMA table_info(articles)")
-        existing_columns = {row[1]: row[2] for row in cursor.fetchall()}
-        
-        missing_columns = set(all_required_columns.keys()) - set(existing_columns.keys())
-        
-        if missing_columns:
-            for col_name in missing_columns:
-                try:
-                    col_type = all_required_columns[col_name]
-                    cursor.execute(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}")
-                    logger.info(f"Added column: {col_name}")
-                except Exception as e:
-                    logger.warning(f"Could not add column {col_name}: {e}")
+        existing = {row[1] for row in cursor.fetchall()}
+        for col, col_type in all_required_columns.items():
+            if col not in existing:
+                cursor.execute(
+                    f"ALTER TABLE articles ADD COLUMN {col} {col_type}"
+                )
+                logger.info(f"Added column: {col}")
     else:
-        column_defs = [f"{col} {dtype}" for col, dtype in all_required_columns.items()]
-        create_sql = f"CREATE TABLE articles ({', '.join(column_defs)})"
-        cursor.execute(create_sql)
-        logger.info("Created new articles table")
-    
+        # brand‑new table
+        column_defs = ", ".join(f"{c} {t}" for c, t in all_required_columns.items())
+        cursor.execute(f"CREATE TABLE articles ({column_defs})")
+        logger.info("Created new, slim articles table")
+
     conn.commit()
     conn.close()
 
@@ -720,6 +767,8 @@ if __name__ == "__main__":
     end = start + CONFIG['BATCH_SIZE']
     batch_tickers = filtered_tickers[start:end]
 
+    all_articles = []  # Collect all articles first
+
     for ticker in batch_tickers:
         try:
             logger.info(f"Processing ticker: {ticker}")
@@ -730,21 +779,26 @@ if __name__ == "__main__":
                 logger.warning(f"No articles processed for {ticker}")
                 continue
 
-            df = pd.DataFrame(articles)
-
-            # Apply feature engineering
-            feature_engineer = FinancialNewsFeatureEngineer()
-            df = feature_engineer.feature_engineering_pipeline(df)
-
-            # Save the engineered articles, not the raw list
-            save_articles(df.to_dict(orient="records"))
+            all_articles.extend(articles)
 
         except Exception as e:
             logger.error(f"Failed to process ticker {ticker}: {e}")
             continue
 
-    logger.info("Pipeline complete.")
+    # Now apply feature engineering to ALL articles at once
+    if all_articles:
+        df = pd.DataFrame(all_articles)
+        
+        # Save the articles (with additional features)
+        df = feature_engineering_pipeline(df)
+        save_articles(df.to_dict(orient="records"))
+        
+        logger.info(f"Final dataset has {df.shape[0]} rows × {df.shape[1]} columns")
+        logger.info(f"Columns: {list(df.columns)}")
+    else:
+        logger.warning("No articles to process")
 
+    logger.info("Pipeline complete.")
 
 
 

@@ -1,13 +1,15 @@
 import pandas as pd
+import os
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from collections import defaultdict, Counter
 import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
+from collections import defaultdict, Counter
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+import joblib
 import yfinance as yf
 
 # Configure logging
@@ -21,20 +23,50 @@ class DynamicSentimentLearner:
         self.vectorizer = None
         self.logger = logging.getLogger(__name__)
         self.sentiment_weights = {}
+        
+        # Load existing model and vectorizer if available
+        self._load_existing_models()
+    
+    def _load_existing_models(self):
+        """Load pre-trained model and vectorizer if they exist"""
+        try:
+            if os.path.exists("sentiment_model.pkl") and os.path.exists("vectorizer.pkl"):
+                self.sentiment_model = joblib.load("sentiment_model.pkl")
+                self.vectorizer = joblib.load("vectorizer.pkl")
+                self.logger.info("Loaded existing sentiment model and vectorizer")
+        except Exception as e:
+            self.logger.warning(f"Failed to load existing models: {e}")
+            self.sentiment_model = None
+            self.vectorizer = None
     
     def load_sentiment_keywords_from_csv(self, csv_path="sentiment_keywords.csv"):
         """Load basic sentiment keywords from a CSV file and convert them into weighted entries"""
         try:
+            if not os.path.exists(csv_path):
+                self.logger.warning(f"CSV file {csv_path} not found, skipping keyword loading")
+                return
+                
             df = pd.read_csv(csv_path)
+            
+            # Validate required columns
+            if 'keyword' not in df.columns or 'sentiment' not in df.columns:
+                self.logger.error("CSV must contain 'keyword' and 'sentiment' columns")
+                return
+            
             for _, row in df.iterrows():
                 keyword = str(row["keyword"]).lower().strip()
                 sentiment = str(row["sentiment"]).lower().strip()
+                
+                if not keyword or keyword == 'nan':
+                    continue
+                    
                 if sentiment == "positive":
                     weight = 1.0
                 elif sentiment == "negative":
                     weight = -1.0
                 else:
                     continue
+                    
                 self.sentiment_weights[keyword] = {
                     "weight": weight,
                     "confidence": 1.0,
@@ -52,11 +84,31 @@ class DynamicSentimentLearner:
         # Load sentiment weights from CSV first
         self.load_sentiment_keywords_from_csv("sentiment_keywords.csv")
 
+        # Validate input data
+        if articles_df.empty:
+            self.logger.warning("Empty articles dataframe provided")
+            results['sentiment_weights'] = self.sentiment_weights
+            return results
+
+        # Handle missing values and ensure required columns exist
+        required_columns = ['pct_change_eod', 'tokens']
+        missing_columns = [col for col in required_columns if col not in articles_df.columns]
+        if missing_columns:
+            self.logger.error(f"Missing required columns: {missing_columns}")
+            results['sentiment_weights'] = self.sentiment_weights
+            return results
+
+        # Clean and prepare data
+        articles_df = articles_df.copy()
+        articles_df['tokens'] = articles_df['tokens'].fillna('')
+        articles_df['pct_change_eod'] = pd.to_numeric(articles_df['pct_change_eod'], errors='coerce')
+        
         # Filter articles with valid price data
-        valid_articles = articles_df.dropna(subset=['pct_change_eod', 'tokens'])
+        valid_articles = articles_df.dropna(subset=['pct_change_eod'])
+        valid_articles = valid_articles[valid_articles['tokens'].str.len() > 0]
 
         if len(valid_articles) < 10:
-            self.logger.warning("Insufficient data for sentiment analysis")
+            self.logger.warning(f"Insufficient data for sentiment analysis: {len(valid_articles)} valid articles")
             results['sentiment_weights'] = self.sentiment_weights
             return results
 
@@ -86,40 +138,44 @@ class DynamicSentimentLearner:
         word_stats = {}
         
         for _, article in articles_df.iterrows():
-            # Handle different token formats
-            if isinstance(article['tokens'], str):
-                words = article['tokens'].split()
-            elif isinstance(article['tokens'], list):
-                words = article['tokens']
-            else:
-                continue
-                
-            price_change = article['pct_change_eod']
-            
-            # Define positive/negative outcomes
-            is_positive_outcome = price_change > 0
-            
-            for word in set(words):  # Use set to avoid double counting
-                word = word.lower().strip()
-                if len(word) < 3:  # Skip very short words
+            try:
+                # Handle different token formats
+                if isinstance(article['tokens'], str):
+                    words = article['tokens'].split()
+                elif isinstance(article['tokens'], list):
+                    words = article['tokens']
+                else:
                     continue
                     
-                if word not in word_stats:
-                    word_stats[word] = {
-                        'positive_outcomes': 0,
-                        'negative_outcomes': 0,
-                        'total_occurrences': 0,
-                        'avg_price_change': 0,
-                        'price_changes': []
-                    }
+                price_change = float(article['pct_change_eod'])
                 
-                word_stats[word]['total_occurrences'] += 1
-                word_stats[word]['price_changes'].append(price_change)
+                # Define positive/negative outcomes
+                is_positive_outcome = price_change > 0
                 
-                if is_positive_outcome:
-                    word_stats[word]['positive_outcomes'] += 1
-                else:
-                    word_stats[word]['negative_outcomes'] += 1
+                for word in set(words):  # Use set to avoid double counting
+                    word = word.lower().strip()
+                    if len(word) < 3:  # Skip very short words
+                        continue
+                        
+                    if word not in word_stats:
+                        word_stats[word] = {
+                            'positive_outcomes': 0,
+                            'negative_outcomes': 0,
+                            'total_occurrences': 0,
+                            'avg_price_change': 0,
+                            'price_changes': []
+                        }
+                    
+                    word_stats[word]['total_occurrences'] += 1
+                    word_stats[word]['price_changes'].append(price_change)
+                    
+                    if is_positive_outcome:
+                        word_stats[word]['positive_outcomes'] += 1
+                    else:
+                        word_stats[word]['negative_outcomes'] += 1
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"Error processing article: {e}")
+                continue
         
         # Calculate statistics
         for word, stats in word_stats.items():
@@ -143,37 +199,41 @@ class DynamicSentimentLearner:
         bigram_stats = {}
         
         for _, article in articles_df.iterrows():
-            # Handle different token formats
-            if isinstance(article['tokens'], str):
-                words = article['tokens'].split()
-            elif isinstance(article['tokens'], list):
-                words = article['tokens']
-            else:
-                continue
-                
-            words = [w.lower().strip() for w in words if len(w) >= 3]
-            price_change = article['pct_change_eod']
-            is_positive_outcome = price_change > 0
-            
-            # Generate bigrams
-            for i in range(len(words) - 1):
-                bigram = f"{words[i]} {words[i+1]}"
-                
-                if bigram not in bigram_stats:
-                    bigram_stats[bigram] = {
-                        'positive_outcomes': 0,
-                        'negative_outcomes': 0,
-                        'total_occurrences': 0,
-                        'price_changes': []
-                    }
-                
-                bigram_stats[bigram]['total_occurrences'] += 1
-                bigram_stats[bigram]['price_changes'].append(price_change)
-                
-                if is_positive_outcome:
-                    bigram_stats[bigram]['positive_outcomes'] += 1
+            try:
+                # Handle different token formats
+                if isinstance(article['tokens'], str):
+                    words = article['tokens'].split()
+                elif isinstance(article['tokens'], list):
+                    words = article['tokens']
                 else:
-                    bigram_stats[bigram]['negative_outcomes'] += 1
+                    continue
+                    
+                words = [w.lower().strip() for w in words if len(w) >= 3]
+                price_change = float(article['pct_change_eod'])
+                is_positive_outcome = price_change > 0
+                
+                # Generate bigrams
+                for i in range(len(words) - 1):
+                    bigram = f"{words[i]} {words[i+1]}"
+                    
+                    if bigram not in bigram_stats:
+                        bigram_stats[bigram] = {
+                            'positive_outcomes': 0,
+                            'negative_outcomes': 0,
+                            'total_occurrences': 0,
+                            'price_changes': []
+                        }
+                    
+                    bigram_stats[bigram]['total_occurrences'] += 1
+                    bigram_stats[bigram]['price_changes'].append(price_change)
+                    
+                    if is_positive_outcome:
+                        bigram_stats[bigram]['positive_outcomes'] += 1
+                    else:
+                        bigram_stats[bigram]['negative_outcomes'] += 1
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"Error processing article for bigrams: {e}")
+                continue
         
         # Calculate statistics for bigrams
         for bigram, stats in bigram_stats.items():
@@ -222,14 +282,21 @@ class DynamicSentimentLearner:
             y = []
             
             for _, article in articles_df.iterrows():
-                if isinstance(article['tokens'], str):
-                    X.append(article['tokens'])
-                elif isinstance(article['tokens'], list):
-                    X.append(' '.join(article['tokens']))
-                else:
-                    continue
+                try:
+                    if isinstance(article['tokens'], str):
+                        text = article['tokens']
+                    elif isinstance(article['tokens'], list):
+                        text = ' '.join(article['tokens'])
+                    else:
+                        continue
                     
-                y.append(1 if article['pct_change_eod'] > 0 else 0)
+                    if not text.strip():
+                        continue
+                        
+                    X.append(text)
+                    y.append(1 if float(article['pct_change_eod']) > 0 else 0)
+                except (ValueError, TypeError):
+                    continue
             
             X = np.array(X)
             y = np.array(y)
@@ -262,6 +329,14 @@ class DynamicSentimentLearner:
             self.sentiment_model = LogisticRegression(random_state=42, max_iter=1000)
             self.sentiment_model.fit(X_train_vec, y_train)
             
+            # Save trained model and vectorizer
+            try:
+                joblib.dump(self.sentiment_model, "sentiment_model.pkl")
+                joblib.dump(self.vectorizer, "vectorizer.pkl")
+                self.logger.info("Saved trained model and vectorizer")
+            except Exception as e:
+                self.logger.warning(f"Failed to save model: {e}")
+            
             # Evaluate
             train_score = self.sentiment_model.score(X_train_vec, y_train)
             test_score = self.sentiment_model.score(X_test_vec, y_test)
@@ -270,7 +345,9 @@ class DynamicSentimentLearner:
                 'train_accuracy': train_score,
                 'test_accuracy': test_score,
                 'model_trained': True,
-                'feature_count': X_train_vec.shape[1]
+                'feature_count': X_train_vec.shape[1],
+                'training_samples': len(X_train),
+                'test_samples': len(X_test)
             }
             
         except Exception as e:
@@ -283,6 +360,9 @@ class DynamicSentimentLearner:
             return 0.5  # Neutral
         
         try:
+            if not text or not text.strip():
+                return 0.5
+                
             text_vec = self.vectorizer.transform([text])
             probability = self.sentiment_model.predict_proba(text_vec)[0][1]  # Probability of positive
             return probability
@@ -311,12 +391,15 @@ class DynamicSentimentLearner:
             else:
                 return convert_numpy(obj)
         
-        converted_results = deep_convert(results)
-        
-        with open(filename, 'w') as f:
-            json.dump(converted_results, f, indent=2)
-        
-        self.logger.info(f"Analysis results saved to {filename}")
+        try:
+            converted_results = deep_convert(results)
+            
+            with open(filename, 'w') as f:
+                json.dump(converted_results, f, indent=2)
+            
+            self.logger.info(f"Analysis results saved to {filename}")
+        except Exception as e:
+            self.logger.error(f"Failed to save analysis results: {e}")
 
 
 class NewsProcessor:
@@ -325,62 +408,73 @@ class NewsProcessor:
         self.logger = logging.getLogger(__name__)
     
     def extract_mentions_and_sentiment(self, article_text, ticker):
-        """Basic implementation - replace with your actual method"""
-        # This is a placeholder - implement your actual logic
+        """Basic implementation for extracting mentions and sentiment"""
+        if not article_text:
+            return [], [], [], ""
+            
         words = article_text.lower().split()
-        mentions = [ticker.lower()]
+        mentions = [ticker.lower()] if ticker else []
         
         # Simple positive/negative word lists
-        positive_words = ['growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong']
-        negative_words = ['loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak']
+        positive_words = {'growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong', 
+                         'buy', 'upgrade', 'beat', 'exceed', 'outperform', 'rally', 'surge', 'jump'}
+        negative_words = {'loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak',
+                         'sell', 'downgrade', 'miss', 'underperform', 'crash', 'plunge', 'dive'}
         
         pos_kw = [word for word in words if word in positive_words]
         neg_kw = [word for word in words if word in negative_words]
         
         return mentions, pos_kw, neg_kw, ' '.join(words)
     
-    def get_price_data(self, ticker, parsed_dt):
+    def get_price_data(self, ticker, parsed_dt, max_retries=3):
         """Get price data for the ticker around the given datetime"""
-        try:
-            # This is a simplified version - implement your actual price data logic
-            stock = yf.Ticker(ticker)
-            
-            # Get data for a few days around the article date
-            start_date = parsed_dt - timedelta(days=1)
-            end_date = parsed_dt + timedelta(days=7)
-            
-            hist = stock.history(start=start_date, end=end_date)
-            
-            if hist.empty:
-                return None
-            
-            # Calculate price changes at different intervals
-            base_price = hist['Close'].iloc[0]
-            
-            price_data = {}
-            
-            # End of day change
-            if len(hist) > 1:
-                eod_price = hist['Close'].iloc[1]
-                price_data['pct_change_eod'] = (eod_price - base_price) / base_price * 100
-            
-            # End of week change
-            if len(hist) > 5:
-                eow_price = hist['Close'].iloc[5]
-                price_data['pct_change_eow'] = (eow_price - base_price) / base_price * 100
-            
-            return price_data
-            
-        except Exception as e:
-            self.logger.error(f"Error getting price data for {ticker}: {e}")
+        if not ticker or not parsed_dt:
             return None
+            
+        for attempt in range(max_retries):
+            try:
+                stock = yf.Ticker(ticker)
+                
+                # Get data for a few days around the article date
+                start_date = parsed_dt - timedelta(days=1)
+                end_date = parsed_dt + timedelta(days=7)
+                
+                hist = stock.history(start=start_date, end=end_date)
+                
+                if hist.empty:
+                    self.logger.warning(f"No price data found for {ticker} around {parsed_dt}")
+                    return None
+                
+                # Calculate price changes at different intervals
+                base_price = hist['Close'].iloc[0]
+                price_data = {}
+                
+                # End of day change
+                if len(hist) > 1:
+                    eod_price = hist['Close'].iloc[1]
+                    price_data['pct_change_eod'] = (eod_price - base_price) / base_price * 100
+                
+                # End of week change
+                if len(hist) > 5:
+                    eow_price = hist['Close'].iloc[5]
+                    price_data['pct_change_eow'] = (eow_price - base_price) / base_price * 100
+                
+                return price_data
+                
+            except Exception as e:
+                self.logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {e}")
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to get price data for {ticker} after {max_retries} attempts")
+                    return None
     
     def calculate_dynamic_sentiment(self, text):
-        """Calculate sentiment using dynamic weights - implement your actual method"""
-        # Placeholder implementation
+        """Calculate sentiment using basic dynamic weights"""
+        if not text:
+            return 0
+            
         words = text.lower().split()
-        positive_words = ['growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong']
-        negative_words = ['loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak']
+        positive_words = {'growth', 'profit', 'gain', 'increase', 'rise', 'bullish', 'positive', 'strong'}
+        negative_words = {'loss', 'decline', 'fall', 'decrease', 'drop', 'bearish', 'negative', 'weak'}
         
         pos_score = sum(1 for word in words if word in positive_words)
         neg_score = sum(1 for word in words if word in negative_words)
@@ -419,6 +513,14 @@ class EnhancedNewsProcessor(NewsProcessor):
     
     def calculate_enhanced_sentiment(self, text):
         """Calculate sentiment using multiple methods"""
+        if not text:
+            return {
+                'dynamic_weights': 0,
+                'ml_prediction': 0.5,
+                'keyword_based': 0,
+                'combined': 0
+            }
+            
         sentiment_scores = {}
         
         # Method 1: Dynamic weights (existing)
@@ -428,7 +530,7 @@ class EnhancedNewsProcessor(NewsProcessor):
         if self.sentiment_learner:
             sentiment_scores['ml_prediction'] = self.sentiment_learner.predict_sentiment(text)
         else:
-            sentiment_scores['ml_prediction'] = None
+            sentiment_scores['ml_prediction'] = 0.5
         
         # Method 3: Keyword-based scoring
         sentiment_scores['keyword_based'] = self.calculate_keyword_sentiment(text)
@@ -440,7 +542,7 @@ class EnhancedNewsProcessor(NewsProcessor):
     
     def calculate_keyword_sentiment(self, text):
         """Calculate sentiment based on keyword matching"""
-        if not self.sentiment_weights:
+        if not self.sentiment_weights or not text:
             return 0
         
         words = text.lower().split()
@@ -496,6 +598,9 @@ class EnhancedNewsProcessor(NewsProcessor):
         for method, score in sentiment_scores.items():
             if method in weights and score is not None:
                 weight = weights[method]
+                # Convert ML prediction from 0-1 to -1-1 scale
+                if method == 'ml_prediction':
+                    score = (score - 0.5) * 2
                 combined_score += score * weight
                 total_weight += weight
         
@@ -510,7 +615,7 @@ class EnhancedNewsProcessor(NewsProcessor):
         mentions, pos_kw, neg_kw, tokens = self.extract_mentions_and_sentiment(article_text, ticker)
         
         # Calculate enhanced sentiment
-        full_text = f"{headline} {article_text}"
+        full_text = f"{headline} {article_text}" if headline and article_text else (headline or article_text or "")
         sentiment_scores = self.calculate_enhanced_sentiment(full_text)
         
         # Get price data
@@ -518,9 +623,9 @@ class EnhancedNewsProcessor(NewsProcessor):
         
         # Create enhanced article entry
         article_entry = {
-            "ticker": ticker,
-            "headline": headline,
-            "text": article_text,
+            "ticker": ticker or "",
+            "headline": headline or "",
+            "text": article_text or "",
             "tokens": tokens,
             "mentions": ", ".join(mentions),
             "pos_keywords": ", ".join(pos_kw),
@@ -529,7 +634,7 @@ class EnhancedNewsProcessor(NewsProcessor):
             
             # Enhanced sentiment scores
             "sentiment_dynamic": sentiment_scores.get('dynamic_weights', 0),
-            "sentiment_ml": sentiment_scores.get('ml_prediction', 0),
+            "sentiment_ml": sentiment_scores.get('ml_prediction', 0.5),
             "sentiment_keyword": sentiment_scores.get('keyword_based', 0),
             "sentiment_combined": sentiment_scores.get('combined', 0),
             
@@ -546,7 +651,7 @@ class EnhancedNewsProcessor(NewsProcessor):
             article_entry.update(price_data)
             
             # Calculate prediction accuracy for different sentiment methods
-            intervals = ['eod', 'eow']  # Removed 1h, 4h as they're not implemented
+            intervals = ['eod', 'eow']
             for interval in intervals:
                 pct_change_key = f'pct_change_{interval}'
                 if pct_change_key in price_data and price_data[pct_change_key] is not None:
@@ -556,7 +661,10 @@ class EnhancedNewsProcessor(NewsProcessor):
                     for method in ['dynamic', 'ml', 'keyword', 'combined']:
                         sentiment_key = f'sentiment_{method}'
                         if sentiment_key in article_entry and article_entry[sentiment_key] is not None:
-                            predicted_positive = article_entry[sentiment_key] > 0
+                            if method == 'ml':
+                                predicted_positive = article_entry[sentiment_key] > 0.5
+                            else:
+                                predicted_positive = article_entry[sentiment_key] > 0
                             article_entry[f'accuracy_{method}_{interval}'] = (
                                 predicted_positive == actual_positive
                             )
@@ -564,7 +672,46 @@ class EnhancedNewsProcessor(NewsProcessor):
         return article_entry
 
 
-# Usage example
+def compute_keyword_weights(df, keyword_column, target_column):
+    """Compute keyword weights based on their performance"""
+    if df.empty or keyword_column not in df.columns or target_column not in df.columns:
+        return {}
+        
+    keyword_weights = {}
+    
+    for idx, row in df.iterrows():
+        try:
+            keywords_str = str(row[keyword_column])
+            if keywords_str == 'nan' or not keywords_str.strip():
+                continue
+                
+            keywords = keywords_str.split(',')
+            target = float(row[target_column])
+            
+            for kw in keywords:
+                kw = kw.strip()
+                if kw:
+                    if kw not in keyword_weights:
+                        keyword_weights[kw] = {'count': 0, 'positive': 0}
+                    keyword_weights[kw]['count'] += 1
+                    if target > 0:
+                        keyword_weights[kw]['positive'] += 1
+        except (ValueError, TypeError):
+            continue
+    
+    # Calculate scores
+    for kw in keyword_weights:
+        count = keyword_weights[kw]['count']
+        pos = keyword_weights[kw]['positive']
+        if count > 0:
+            keyword_weights[kw]['score'] = pos / count
+        else:
+            keyword_weights[kw]['score'] = 0.5
+    
+    return keyword_weights
+
+
+# Usage functions
 def run_sentiment_analysis():
     """Run the complete sentiment analysis pipeline"""
     # Load existing data
@@ -593,28 +740,23 @@ def run_sentiment_analysis():
     
     # Print summary
     print(f"Analysis complete:")
-    print(f"- Words analyzed: {len(results['word_analysis'])}")
-    print(f"- Bigrams analyzed: {len(results['bigram_analysis'])}")
-    print(f"- Sentiment weights generated: {len(results['sentiment_weights'])}")
+    print(f"- Words analyzed: {len(results.get('word_analysis', {}))}")
+    print(f"- Bigrams analyzed: {len(results.get('bigram_analysis', {}))}")
+    print(f"- Sentiment weights generated: {len(results.get('sentiment_weights', {}))}")
     
-    if results['model_performance'].get('model_trained'):
-        print(f"- Model accuracy: {results['model_performance']['test_accuracy']:.3f}")
+    if results.get('model_performance', {}).get('model_trained'):
+        perf = results['model_performance']
+        print(f"- Model accuracy: {perf['test_accuracy']:.3f}")
+        print(f"- Training samples: {perf.get('training_samples', 'N/A')}")
+        print(f"- Test samples: {perf.get('test_samples', 'N/A')}")
     else:
-        print(f"- Model training failed: {results['model_performance'].get('error', 'Unknown error')}")
+        error_msg = results.get('model_performance', {}).get('error', 'Unknown error')
+        print(f"- Model training failed: {error_msg}")
 
 
 def process_articles_with_enhanced_sentiment():
     """Process articles using the enhanced sentiment framework"""
     processor = EnhancedNewsProcessor()
-    
-    # Example usage:
-    # article_entry = processor.enhanced_article_processing(
-    #     article_text="Company reports strong quarterly earnings with 20% growth",
-    #     headline="Strong Q4 Results",
-    #     ticker="AAPL",
-    #     parsed_dt=datetime.now()
-    # )
-    
     return processor
 
 if __name__ == "__main__":
