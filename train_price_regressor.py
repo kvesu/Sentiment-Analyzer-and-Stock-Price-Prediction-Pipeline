@@ -1,179 +1,181 @@
+import os
 import pandas as pd
 import numpy as np
-import os
 import joblib
+import json
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score
+)
 
-# === Configuration ===
-INPUT_CSV = "cleaned_engineered_features.csv"
-MODEL_OUTPUT_PATH = "models/stock_price_regressor.pkl"
+# === CONFIGURATION ===
+CLEANED_INPUT = "cleaned_engineered_features.csv"
+MERGED_OUTPUT = "merged_training_data.csv"
+MODEL_OUTPUT = "models/stock_price_regressor.pkl"
+BATCH_SIZE = 100
+
 FEATURE_COLUMNS = [
     "sentiment_combined", "sentiment_dynamic", "sentiment_ml",
     "sentiment_keyword", "mentions", "pos_keywords",
     "neg_keywords", "total_keywords",
     "is_premarket", "is_aftermarket", "is_market_hours"
 ]
-
 TARGET_COLUMN = "pct_change_1h"
 
-# === Load Data ===
-print("Loading data...")
-df = pd.read_csv(INPUT_CSV)
-print(f"Original data shape: {df.shape}")
+# === STEP 1: Merge scraped article CSVs ===
+def merge_scraped_articles(directory="."):
+    all_dfs = []
+    for file in os.listdir(directory):
+        if file.startswith("scraped_articles") and file.endswith(".csv"):
+            df = pd.read_csv(os.path.join(directory, file))
+            all_dfs.append(df)
+    if all_dfs:
+        merged_df = pd.concat(all_dfs, ignore_index=True)
+        merged_df.drop_duplicates(subset=["url"], inplace=True)
+        merged_df.to_csv(MERGED_OUTPUT, index=False)
+        print(f"Merged {len(all_dfs)} files into {MERGED_OUTPUT} with {merged_df.shape[0]} rows.")
+        return merged_df
+    else:
+        print("No scraped_articles CSV files found.")
+        return pd.DataFrame()
 
-# Check which feature columns actually exist in the data
-available_features = [col for col in FEATURE_COLUMNS if col in df.columns]
-missing_features = [col for col in FEATURE_COLUMNS if col not in df.columns]
-
-if missing_features:
-    print(f"Warning: Missing features: {missing_features}")
-    print(f"Available features: {available_features}")
+# === STEP 2: Train model ===
+def train_model(input_csv):
+    global FEATURE_COLUMNS  # Move this to the top, before any usage
     
-if not available_features:
-    print("Error: No feature columns found in the dataset!")
-    print(f"Available columns: {list(df.columns)}")
-    exit(1)
+    print("Loading data...")
+    df = pd.read_csv(input_csv)
+    print(f"Original data shape: {df.shape}")
 
-# Update feature columns to only use available ones
-FEATURE_COLUMNS = available_features
-print(f"Using {len(FEATURE_COLUMNS)} features: {FEATURE_COLUMNS}")
+    available_features = [col for col in FEATURE_COLUMNS if col in df.columns]
+    missing_features = [col for col in FEATURE_COLUMNS if col not in df.columns]
 
-# Check if target column exists
-if TARGET_COLUMN not in df.columns:
-    print(f"Error: Target column '{TARGET_COLUMN}' not found!")
-    print(f"Available columns: {list(df.columns)}")
-    exit(1)
+    if missing_features:
+        print(f"Warning: Missing features: {missing_features}")
+        print(f"Available features: {available_features}")
+    
+    if not available_features:
+        print("Error: No valid feature columns found in the dataset!")
+        exit(1)
 
-# Drop rows with missing values in features or target
-print("Cleaning data...")
-initial_rows = len(df)
-df = df.dropna(subset=FEATURE_COLUMNS + [TARGET_COLUMN])
-final_rows = len(df)
-print(f"Dropped {initial_rows - final_rows} rows with missing values")
-print(f"Final data shape: {df.shape}")
+    FEATURE_COLUMNS = available_features
 
-if len(df) == 0:
-    print("Error: No data remaining after cleaning!")
-    exit(1)
+    if TARGET_COLUMN not in df.columns:
+        print(f"Error: Target column '{TARGET_COLUMN}' not found!")
+        exit(1)
 
-# === Prepare Features and Target ===
-X = df[FEATURE_COLUMNS]
-y = df[TARGET_COLUMN]
+    # Clean data
+    initial_rows = len(df)
+    df = df.dropna(subset=FEATURE_COLUMNS + [TARGET_COLUMN])
+    final_rows = len(df)
+    print(f"Dropped {initial_rows - final_rows} rows with missing values")
+    print(f"Final data shape: {df.shape}")
 
-print(f"Feature matrix shape: {X.shape}")
-print(f"Target vector shape: {y.shape}")
-print(f"Target statistics:")
-print(f"  Mean: {y.mean():.4f}")
-print(f"  Std:  {y.std():.4f}")
-print(f"  Min:  {y.min():.4f}")
-print(f"  Max:  {y.max():.4f}")
+    if len(df) == 0:
+        print("Error: No data remaining after cleaning!")
+        exit(1)
 
-# === Split Data ===
-print("Splitting data...")
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=None
-)
+    X = df[FEATURE_COLUMNS]
+    y = df[TARGET_COLUMN]
 
-print(f"Training set: {X_train.shape[0]} samples")
-print(f"Test set: {X_test.shape[0]} samples")
+    print(f"Feature matrix shape: {X.shape}")
+    print(f"Target vector shape: {y.shape}")
+    print(f"Target stats: mean={y.mean():.4f}, std={y.std():.4f}, min={y.min():.4f}, max={y.max():.4f}")
 
-# === Train Model ===
-print("Training Random Forest model...")
-model = RandomForestRegressor(
-    n_estimators=100, 
-    random_state=42,
-    n_jobs=-1,  # Use all available cores
-    verbose=1   # Show progress
-)
-model.fit(X_train, y_train)
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
-# === Evaluate Model ===
-print("Evaluating model...")
-y_pred = model.predict(X_test)
+    print("Training Random Forest model...")
+    model = RandomForestRegressor(
+        n_estimators=100,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1
+    )
+    model.fit(X_train, y_train)
 
-# Calculate metrics (compatible with older scikit-learn versions)
-mae = mean_absolute_error(y_test, y_pred)
-mse = mean_squared_error(y_test, y_pred)
-rmse = np.sqrt(mse)  # Calculate RMSE manually
-r2 = r2_score(y_test, y_pred)
+    y_pred = model.predict(X_test)
 
-print("\n" + "="*50)
-print("MODEL EVALUATION RESULTS")
-print("="*50)
-print(f"Mean Absolute Error (MAE):  {mae:.4f}")
-print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
-print(f"R² Score: {r2:.4f}")
-print("="*50)
+    # Evaluation
+    mae = mean_absolute_error(y_test, y_pred)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
 
-# === Feature Importance ===
-print("\nFEATURE IMPORTANCE:")
-feature_importance = pd.DataFrame({
-    'feature': FEATURE_COLUMNS,
-    'importance': model.feature_importances_
-}).sort_values('importance', ascending=False)
+    print("\n=== MODEL EVALUATION RESULTS ===")
+    print(f"MAE:  {mae:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"R²:   {r2:.4f}")
 
-for idx, row in feature_importance.iterrows():
-    print(f"  {row['feature']}: {row['importance']:.4f}")
+    # Feature importance
+    feature_importance = pd.DataFrame({
+        'feature': FEATURE_COLUMNS,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
 
-# === Model Performance Analysis ===
-print("\nMODEL PERFORMANCE ANALYSIS:")
-# Calculate residuals
-residuals = y_test - y_pred
-print(f"Residual statistics:")
-print(f"  Mean residual: {residuals.mean():.4f}")
-print(f"  Std residual:  {residuals.std():.4f}")
+    print("\n=== FEATURE IMPORTANCE ===")
+    for idx, row in feature_importance.iterrows():
+        print(f"{row['feature']}: {row['importance']:.4f}")
 
-# Check for outliers in predictions
-outlier_threshold = 2 * rmse
-outliers = np.abs(residuals) > outlier_threshold
-print(f"  Outliers (>2*RMSE): {outliers.sum()} ({100*outliers.mean():.1f}%)")
+    # Residual analysis
+    residuals = y_test - y_pred
+    outlier_threshold = 2 * rmse
+    outliers = np.abs(residuals) > outlier_threshold
 
-# Performance by prediction range
-pred_ranges = [
-    ("Very Negative", y_pred < -2),
-    ("Negative", (y_pred >= -2) & (y_pred < 0)),
-    ("Positive", (y_pred >= 0) & (y_pred < 2)),
-    ("Very Positive", y_pred >= 2)
-]
+    print("\n=== RESIDUAL ANALYSIS ===")
+    print(f"Mean residual: {residuals.mean():.4f}")
+    print(f"Outliers (>2*RMSE): {outliers.sum()} ({100 * outliers.mean():.2f}%)")
 
-print(f"\nPerformance by prediction range:")
-for range_name, mask in pred_ranges:
-    if mask.sum() > 0:
-        range_mae = mean_absolute_error(y_test[mask], y_pred[mask])
-        print(f"  {range_name}: {mask.sum()} samples, MAE = {range_mae:.4f}")
+    # Range analysis
+    print("\n=== PREDICTION RANGE MAE ===")
+    pred_ranges = [
+        ("Very Negative", y_pred < -2),
+        ("Negative", (y_pred >= -2) & (y_pred < 0)),
+        ("Positive", (y_pred >= 0) & (y_pred < 2)),
+        ("Very Positive", y_pred >= 2)
+    ]
+    for label, mask in pred_ranges:
+        if mask.sum():
+            range_mae = mean_absolute_error(y_test[mask], y_pred[mask])
+            print(f"{label}: {mask.sum()} samples, MAE = {range_mae:.4f}")
 
-# === Save Model ===
-print(f"\nSaving model...")
-os.makedirs(os.path.dirname(MODEL_OUTPUT_PATH), exist_ok=True)
-joblib.dump(model, MODEL_OUTPUT_PATH)
-print(f"Trained model saved to {MODEL_OUTPUT_PATH}")
+    # Save model
+    os.makedirs(os.path.dirname(MODEL_OUTPUT), exist_ok=True)
+    joblib.dump(model, MODEL_OUTPUT)
+    print(f"Model saved to {MODEL_OUTPUT}")
 
-# === Save Feature Importance ===
-feature_importance_path = MODEL_OUTPUT_PATH.replace('.pkl', '_feature_importance.csv')
-feature_importance.to_csv(feature_importance_path, index=False)
-print(f"Feature importance saved to {feature_importance_path}")
+    # Save feature importance
+    importance_path = MODEL_OUTPUT.replace('.pkl', '_feature_importance.csv')
+    feature_importance.to_csv(importance_path, index=False)
+    print(f"Feature importance saved to {importance_path}")
 
-# === Save Model Metadata ===
-metadata = {
-    'model_type': 'RandomForestRegressor',
-    'n_estimators': 100,
-    'features': FEATURE_COLUMNS,
-    'target': TARGET_COLUMN,
-    'training_samples': len(X_train),
-    'test_samples': len(X_test),
-    'mae': mae,
-    'rmse': rmse,
-    'r2': r2,
-    'feature_count': len(FEATURE_COLUMNS)
-}
+    # Save metadata
+    metadata = {
+        'model_type': 'RandomForestRegressor',
+        'features': FEATURE_COLUMNS,
+        'target': TARGET_COLUMN,
+        'training_samples': len(X_train),
+        'test_samples': len(X_test),
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'n_estimators': 100
+    }
+    metadata_path = MODEL_OUTPUT.replace('.pkl', '_metadata.json')
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to {metadata_path}")
 
-metadata_path = MODEL_OUTPUT_PATH.replace('.pkl', '_metadata.json')
-import json
-with open(metadata_path, 'w') as f:
-    json.dump(metadata, f, indent=2)
-print(f"Model metadata saved to {metadata_path}")
+    print("\n Training complete. Model is ready for prediction.")
 
-print(f"\n Training complete! Model ready for prediction.")
-print(f"Model files saved in: {os.path.dirname(MODEL_OUTPUT_PATH)}")
+# === MAIN EXECUTION ===
+if __name__ == "__main__":
+    merged_df = merge_scraped_articles()
+    if not merged_df.empty:
+        # Assume merged_df is already cleaned/engineered if using it directly
+        train_model(CLEANED_INPUT)
+    else:
+        print("Skipped model training due to no new data.")

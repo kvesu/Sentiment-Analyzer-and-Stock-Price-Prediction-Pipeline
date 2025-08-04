@@ -13,36 +13,32 @@ from difflib import get_close_matches
 from googlesearch import search
 import numpy as np
 import json
+import time
 from word_analysis_framework import DynamicSentimentLearner, EnhancedNewsProcessor
 from feature_engineering import feature_engineering_pipeline
+from ticker_filter_test import get_tickers_with_news
+
+# List of rotating User-Agent headers
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 10; SM-G975F)",
+    "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X)",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64)",
+    "Mozilla/5.0 (X11; Linux x86_64)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+]
 
 # Configuration
 CONFIG = {
     'DB_PATH': "articles.db",
     'CSV_INPUT': "finviz.csv", 
     'CSV_OUTPUT': "scraped_articles.csv",
-    'MAX_TICKERS': None,
+    'MAX_TICKERS': 1000,
     'BATCH_SIZE': 50,
     'BATCH_START': 0,
-    'DAYS_BACK': 7,
-    'USER_AGENT': "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    'NO_NEWS_CACHE': "tickers_with_no_news.json",  
-    'REFRESH_NO_NEWS_CACHE': False                 
+    'DAYS_BACK': 7,               
 }
-
-# No news cache loading
-def load_no_news_cache():
-    if os.path.exists(CONFIG['NO_NEWS_CACHE']) and not CONFIG['REFRESH_NO_NEWS_CACHE']:
-        with open(CONFIG['NO_NEWS_CACHE'], 'r') as f:
-            return set(json.load(f))
-    return set()
-
-def save_no_news_cache(tickers):
-    try:
-        with open(CONFIG['NO_NEWS_CACHE'], 'w') as f:
-            json.dump(list(tickers), f)
-    except Exception as e:
-        logger.warning(f"Failed to save no-news cache: {e}")
 
 # Suppress yfinance warnings
 yf_logger = logging.getLogger("yfinance")
@@ -218,16 +214,20 @@ class SimplifiedPriceAnalyzer:
     
 class NewsProcessor:
     def __init__(self):
+        # Initialize session and core components
         self.session = self._create_session()
         self.valid_tickers = self._load_tickers()
         self.stopwords = self._setup_nltk()
         self.lemmatizer = WordNetLemmatizer()
+        
+        # Initialize KeyBERT model
         try:
             self.kw_model = KeyBERT(model='all-MiniLM-L6-v2')
         except Exception as e:
             self.kw_model = None
             logger.warning(f"KeyBERT model not available: {e}")
-        self.headers = {"User-Agent": CONFIG['USER_AGENT']}
+        
+        # Initialize analyzers
         self.price_analyzer = SimplifiedPriceAnalyzer()
         
         # Initialize enhanced sentiment analysis
@@ -251,7 +251,7 @@ class NewsProcessor:
             return 0
         
         words = text.split()
-        sentiment_score = 0
+        sentiment_score = 0  # Initialize sentiment_score
         total_weight = 0
         
         for word in words:
@@ -330,7 +330,7 @@ class NewsProcessor:
         now = datetime.now()
         s = s.strip().lower()
         
-        # FIXED: Better handling of relative dates
+        # Better handling of relative dates
         if s.startswith("today"):
             return now.replace(hour=9, minute=30, second=0, microsecond=0)
         if s.startswith("yesterday"):
@@ -417,11 +417,11 @@ class NewsProcessor:
     
     def scrape_article(self, url):
         try:
-            response = self.session.get(url, headers=self.headers, timeout=15)
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            # FIXED: Better content extraction
             # Remove script and style elements
             for script in soup(["script", "style"]):
                 script.decompose()
@@ -466,21 +466,23 @@ class NewsProcessor:
         return "", ""
     
     def fetch_finviz_news(self, ticker):
+        """Fetch news for a ticker (enhanced with better error handling)"""
         url = f"https://finviz.com/quote.ashx?t={ticker}"
         try:
-            response = self.session.get(url, headers=self.headers, timeout=10)
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
         except Exception as e:
             logger.error(f"Finviz fetch failed for {ticker}: {e}")
             return []
-        
+
         soup = BeautifulSoup(response.text, "html.parser")
         news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
         
         if not news_table:
             logger.warning(f"No news table found for {ticker}")
             return []
-        
+
         articles = []
         cutoff_date = datetime.now() - timedelta(days=CONFIG['DAYS_BACK'])
         
@@ -524,7 +526,7 @@ class NewsProcessor:
                 "headline": headline,
                 "url": article_url,
                 "text": article_text,
-                "tokens": tokens,  # Add the preprocessed tokens
+                "tokens": tokens,
                 
                 # Sentiment signals
                 "sentiment_dynamic": enhanced_sentiment.get('dynamic_weights', 0),
@@ -564,9 +566,32 @@ class NewsProcessor:
         return (is_sentiment_positive and pct_change > 0) or (not is_sentiment_positive and pct_change < 0)
     
     def filter_tickers_with_news(self, tickers):
-        """Filter tickers that have news - simplified version"""
-        # Simply return the sorted tickers without checking news table
-        return sorted(tickers)
+        """Filter tickers that have news available (fallback method)"""
+        tickers_with_news = []
+        
+        for ticker in tickers[:20]:  # Limit for testing
+            try:
+                url = f"https://finviz.com/quote.ashx?t={ticker}"
+                headers = {"User-Agent": random.choice(USER_AGENTS)}
+                response = self.session.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.text, "html.parser")
+                news_table = soup.select_one("table.fullview-news-outer") or soup.select_one("#news-table")
+                
+                if news_table and news_table.find_all("tr"):
+                    tickers_with_news.append(ticker)
+                    logger.info(f"✓ {ticker} has news")
+                else:
+                    logger.debug(f"✗ {ticker} no news")
+                    
+                time.sleep(random.uniform(1, 2))  # Rate limiting
+                
+            except Exception as e:
+                logger.warning(f"Error checking {ticker}: {e}")
+                continue
+        
+        return tickers_with_news
     
 def init_database():
     """Create (or patch) a lean 'articles' table that matches the minimal feature set."""
@@ -586,9 +611,9 @@ def init_database():
     "sentiment_keyword": "REAL",
     "sentiment_combined": "REAL",
     "prediction_confidence": "REAL",
-    "mentions": "INTEGER",
-    "pos_keywords": "INTEGER",
-    "neg_keywords": "INTEGER",
+    "mentions": "TEXT",
+    "pos_keywords": "TEXT",
+    "neg_keywords": "TEXT",
     "total_keywords": "INTEGER",
 
     # price changes and directions
@@ -688,117 +713,278 @@ def init_database():
     conn.close()
 
 def save_articles(articles):
+    """Save articles to both CSV and database with proper error handling"""
     if not articles:
         logger.warning("No articles to save")
         return
-    
+
     df = pd.DataFrame(articles)
-    df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
-    logger.info(f"Saved {len(articles)} articles to {CONFIG['CSV_OUTPUT']}")
-    
-    # Show accuracy stats for different sentiment methods
-    methods = ['dynamic', 'ml', 'keyword', 'combined']
-    intervals = ['1h', '4h', 'eod', 'eow']
-    
-    for method in methods:
-        for interval in intervals:
-            col = f'accuracy_{method}_{interval}'
-            if col in df.columns:
-                valid = df[col].dropna()
-                if not valid.empty:
-                    correct = valid.sum()
-                    total = len(valid)
-                    logger.info(f"Prediction accuracy {method.upper()} {interval.upper()}: {correct}/{total} ({correct/total*100:.1f}%)")
-    
-    # Show average price changes
-    for interval in intervals:
-        col = f'pct_change_{interval}'
-        if col in df.columns:
-            avg_change = df[col].mean()
-            if not pd.isna(avg_change):
-                logger.info(f"Average price change {interval.upper()}: {avg_change:+.2f}%")
-    
+    logger.info(f"Processing {len(df)} articles for saving")
+
+    # Save to CSV
+    try:
+        if os.path.exists(CONFIG['CSV_OUTPUT']):
+            existing_df = pd.read_csv(CONFIG['CSV_OUTPUT'])
+            # Check for duplicates before combining
+            existing_urls = set(existing_df['url'].tolist()) if 'url' in existing_df.columns else set()
+            new_articles_df = df[~df['url'].isin(existing_urls)]
+            
+            if not new_articles_df.empty:
+                combined_df = pd.concat([existing_df, new_articles_df], ignore_index=True)
+                combined_df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
+                logger.info(f"Added {len(new_articles_df)} new articles to existing CSV")
+            else:
+                logger.info("No new articles to add to CSV (all duplicates)")
+        else:
+            df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
+            logger.info(f"Created new CSV with {len(df)} articles")
+    except Exception as e:
+        logger.error(f"Error saving to CSV: {e}")
+
     # Save to database
     conn = sqlite3.connect(CONFIG['DB_PATH'])
     try:
+        # Check for existing articles by URL
         try:
-            existing_urls = pd.read_sql("SELECT url FROM articles", conn)["url"].tolist()
-            new_articles = df[~df["url"].isin(existing_urls)]
+            existing_urls_query = "SELECT url FROM articles WHERE url IS NOT NULL"
+            existing_urls = pd.read_sql(existing_urls_query, conn)["url"].tolist()
+            new_articles_df = df[~df["url"].isin(existing_urls)]
+            logger.info(f"Found {len(existing_urls)} existing URLs, {len(new_articles_df)} new articles to insert")
         except Exception as e:
-            logger.warning(f"Could not check existing URLs: {e}")
-            new_articles = df
+            logger.warning(f"Could not check existing URLs, inserting all: {e}")
+            new_articles_df = df
         
-        if not new_articles.empty:
-            # Fill NaN values with appropriate defaults
-            new_articles = new_articles.fillna({
+        if not new_articles_df.empty:
+            # Fill NaN values with appropriate defaults before inserting
+            new_articles_filled = new_articles_df.fillna({
                 'text': '',
                 'tokens': '',
                 'mentions': '',
                 'pos_keywords': '',
                 'neg_keywords': '',
                 'total_keywords': 0,
-                'sentiment_score': 0,
                 'sentiment_dynamic': 0.0,
                 'sentiment_ml': 0.0,
                 'sentiment_keyword': 0.0,
                 'sentiment_combined': 0.0,
-                'prediction_confidence': 0.0
+                'prediction_confidence': 0.0,
+                'pct_change_1h': 0.0,    
+                'pct_change_4h': 0.0,    
+                'pct_change_eod': 0.0,   
+                'pct_change_eow': 0.0,   
+                'direction_1h': 'No Data',
+                'direction_4h': 'No Data',
+                'direction_eod': 'No Data',
+                'direction_eow': 'No Data'
             })
 
-            new_articles.to_sql("articles", conn, if_exists="append", index=False)
-            logger.info(f"Inserted {len(new_articles)} new articles into the database")
+            # Insert into database
+            new_articles_filled.to_sql("articles", conn, if_exists="append", index=False)
+            logger.info(f"Successfully inserted {len(new_articles_filled)} new articles into database")
+            
+            # Show some statistics
+            show_article_statistics(new_articles_filled)
+            
         else:
-            logger.info("No new articles to insert")
+            logger.info("No new articles to insert into database (all duplicates)")
 
     except Exception as e:
         logger.error(f"Error saving articles to database: {e}")
+        # Print more details about the error
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
     finally:
         conn.close()
 
-if __name__ == "__main__":
+def show_article_statistics(df):
+    """Show statistics about the processed articles"""
+    if df.empty:
+        return
+        
+    # Show accuracy stats for different sentiment methods
+    methods = ['dynamic', 'ml', 'keyword', 'combined']
+    intervals = ['1h', '4h', 'eod', 'eow']
+    
+    logger.info("=== Article Processing Statistics ===")
+    
+    # Basic stats
+    logger.info(f"Total articles: {len(df)}")
+    logger.info(f"Unique tickers: {df['ticker'].nunique()}")
+    
+    # Price change statistics
+    for interval in intervals:
+        col = f'pct_change_{interval}'
+        if col in df.columns:
+            valid_changes = df[col].dropna()
+            if not valid_changes.empty:
+                avg_change = valid_changes.mean()
+                pos_changes = (valid_changes > 0).sum()
+                neg_changes = (valid_changes < 0).sum()
+                logger.info(f"Price changes {interval.upper()}: avg={avg_change:+.2f}%, pos={pos_changes}, neg={neg_changes}")
+    
+    # Sentiment distribution
+    if 'sentiment_combined' in df.columns:
+        sentiment_scores = df['sentiment_combined'].dropna()
+        if not sentiment_scores.empty:
+            avg_sentiment = sentiment_scores.mean()
+            pos_sentiment = (sentiment_scores > 0).sum()
+            neg_sentiment = (sentiment_scores < 0).sum()
+            logger.info(f"Sentiment: avg={avg_sentiment:.3f}, positive={pos_sentiment}, negative={neg_sentiment}")
+
+# Main execution logic
+def main():
+    """Main execution function using pre-filtered tickers"""
+    print("MAIN FUNCTION STARTED")
     logger.info("Starting News Sentiment Analysis Pipeline")
 
-    init_database()
-    processor = NewsProcessor()
+    try:
+        init_database()
+        processor = NewsProcessor()
 
-    filtered_tickers = processor.filter_tickers_with_news(processor.valid_tickers)
-
-    start = CONFIG['BATCH_START']
-    end = start + CONFIG['BATCH_SIZE']
-    batch_tickers = filtered_tickers[start:end]
-
-    all_articles = []  # Collect all articles first
-
-    for ticker in batch_tickers:
+        # Try to get pre-filtered tickers first
+        logger.info("Loading pre-filtered tickers...")
+        filtered_tickers = []
+        
         try:
-            logger.info(f"Processing ticker: {ticker}")
-
-            articles = processor.fetch_finviz_news(ticker)
-
-            if not articles:
-                logger.warning(f"No articles processed for {ticker}")
-                continue
-
-            all_articles.extend(articles)
-
+            filtered_tickers = get_tickers_with_news()
+            logger.info(f"Loaded {len(filtered_tickers)} pre-filtered tickers")
         except Exception as e:
-            logger.error(f"Failed to process ticker {ticker}: {e}")
-            continue
-
-    # Now apply feature engineering to ALL articles at once
-    if all_articles:
-        df = pd.DataFrame(all_articles)
+            logger.warning(f"Failed to load pre-filtered tickers: {e}")
         
-        # Save the articles (with additional features)
-        df = feature_engineering_pipeline(df)
-        save_articles(df.to_dict(orient="records"))
+        if not filtered_tickers:
+            logger.warning("No pre-filtered tickers found. Using fallback method...")
+            # Fallback to original method
+            all_tickers = sorted(list(processor.valid_tickers))
+            if CONFIG['MAX_TICKERS']:
+                all_tickers = all_tickers[:CONFIG['MAX_TICKERS']]
+            
+            try:
+                filtered_tickers = processor.filter_tickers_with_news(all_tickers)
+            except AttributeError:
+                logger.error("filter_tickers_with_news method not found. Using first 10 tickers as fallback.")
+                filtered_tickers = all_tickers[:10]
         
-        logger.info(f"Final dataset has {df.shape[0]} rows × {df.shape[1]} columns")
-        logger.info(f"Columns: {list(df.columns)}")
-    else:
-        logger.warning("No articles to process")
+        total_tickers = len(filtered_tickers)
+        
+        if total_tickers == 0:
+            logger.error("No tickers with news found")
+            return
 
-    logger.info("Pipeline complete.")
+        # REMOVE THE TESTING LIMITATION - Process up to MAX_TICKERS
+        if total_tickers > CONFIG['MAX_TICKERS']:
+            # Randomly sample for better diversity instead of just taking first N
+            import random
+            random.shuffle(filtered_tickers)  # Shuffle for random sampling
+            filtered_tickers = filtered_tickers[:CONFIG['MAX_TICKERS']]
+            total_tickers = CONFIG['MAX_TICKERS']
+            logger.info(f"Randomly sampled {total_tickers} tickers from available pool")
+        
+        logger.info(f"Processing {total_tickers} tickers: {filtered_tickers[:10]}... (showing first 10)")
 
+        all_articles = []
+        processed_count = 0
+        error_count = 0
 
+        # Process tickers in batches for better management
+        batch_size = CONFIG['BATCH_SIZE']
+        total_batches = (total_tickers + batch_size - 1) // batch_size
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_tickers)
+            batch_tickers = filtered_tickers[start_idx:end_idx]
+            
+            logger.info(f"Processing batch {batch_num + 1}/{total_batches} ({len(batch_tickers)} tickers)")
+            
+            batch_articles = []
+            
+            for i, ticker in enumerate(batch_tickers, 1):
+                try:
+                    global_index = start_idx + i
+                    logger.info(f"Processing ticker {global_index}/{total_tickers}: {ticker}")
+                    
+                    articles = processor.fetch_finviz_news(ticker)
+                    
+                    if articles:
+                        batch_articles.extend(articles)
+                        logger.info(f"  → Found {len(articles)} articles for {ticker}")
+                    else:
+                        logger.warning(f"  → No articles found for {ticker}")
+                    
+                    processed_count += 1
+                    
+                    # Progress update every 10 tickers
+                    if processed_count % 10 == 0:
+                        logger.info(f"Progress: {processed_count}/{total_tickers} tickers processed, "
+                                  f"{len(all_articles + batch_articles)} total articles collected")
+                    
+                    # Rate limiting - slightly faster for larger batches
+                    if i < len(batch_tickers):
+                        sleep_time = random.uniform(1.5, 3.0)  # Reduced from 2-4s
+                        time.sleep(sleep_time)
+
+                except Exception as e:
+                    error_count += 1
+                    logger.error(f"Failed to process ticker {ticker}: {e}")
+                    continue
+            
+            # Add batch articles to total
+            all_articles.extend(batch_articles)
+            logger.info(f"Batch {batch_num + 1} completed: {len(batch_articles)} articles")
+            
+            # Save progress after each batch (in case of interruption)
+            if batch_articles:
+                try:
+                    df_batch = pd.DataFrame(all_articles)
+                    df_batch = feature_engineering_pipeline(df_batch)
+                    save_articles(df_batch.to_dict(orient="records"))
+                    logger.info(f"Progress saved: {len(all_articles)} total articles")
+                except Exception as e:
+                    logger.warning(f"Failed to save batch progress: {e}")
+            
+            # Longer pause between batches to avoid rate limiting
+            if batch_num < total_batches - 1:
+                logger.info("Pausing 30 seconds between batches...")
+                time.sleep(30)
+
+        # Final processing and saving
+        if all_articles:
+            logger.info(f"Collection completed: {len(all_articles)} articles from {processed_count} tickers")
+            logger.info(f"Success rate: {((processed_count - error_count) / processed_count * 100):.1f}%")
+            
+            # Final feature engineering and save
+            df = pd.DataFrame(all_articles)
+            try:
+                df = feature_engineering_pipeline(df)
+                logger.info("Final feature engineering completed")
+            except Exception as e:
+                logger.warning(f"Feature engineering failed: {e}")
+                # Add minimal required columns as fallback
+                for col in ['day_of_week', 'hour_of_day', 'is_weekend']:
+                    if col not in df.columns:
+                        df[col] = 0
+                
+            save_articles(df.to_dict(orient="records"))
+            
+            # Show final statistics
+            logger.info("=== FINAL STATISTICS ===")
+            logger.info(f"Tickers processed: {processed_count}")
+            logger.info(f"Errors encountered: {error_count}")
+            logger.info(f"Total articles collected: {len(all_articles)}")
+            logger.info(f"Average articles per ticker: {len(all_articles)/processed_count:.1f}")
+            logger.info(f"Unique tickers with articles: {df['ticker'].nunique()}")
+            
+            logger.info("Pipeline completed successfully")
+        else:
+            logger.warning("No articles found for any tickers")
+
+    except Exception as e:
+        logger.error(f"Pipeline failed with error: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
+if __name__ == "__main__":
+    print("Script started, calling main()")
+    main()
+    print("Script completed")
 
