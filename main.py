@@ -15,11 +15,12 @@ import numpy as np
 import json
 import time
 from word_analysis_framework import DynamicSentimentLearner, EnhancedNewsProcessor
-from feature_engineering import feature_engineering_pipeline
+from feature_engineering import FinancialNewsFeatureEngineer
 from ticker_filter_test import get_tickers_with_news
+import traceback
 
 # List of rotating User-Agent headers
-USER_AGENTS = [
+USER_AGENTS = [ 
     "Mozilla/5.0 (Linux; Android 10; SM-G975F)",
     "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X)",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)",
@@ -34,10 +35,10 @@ CONFIG = {
     'DB_PATH': "articles.db",
     'CSV_INPUT': "finviz.csv", 
     'CSV_OUTPUT': "scraped_articles.csv",
-    'MAX_TICKERS': 1000,
+    'MAX_TICKERS': 1250,
     'BATCH_SIZE': 50,
     'BATCH_START': 0,
-    'DAYS_BACK': 7,               
+    'DAYS_BACK': 7,          
 }
 
 # Suppress yfinance warnings
@@ -230,47 +231,94 @@ class NewsProcessor:
         # Initialize analyzers
         self.price_analyzer = SimplifiedPriceAnalyzer()
         
-        # Initialize enhanced sentiment analysis
+        # Initialize ENHANCED sentiment analysis
         self.sentiment_learner = DynamicSentimentLearner()
         self.enhanced_processor = EnhancedNewsProcessor()
         self.sentiment_weights = self.load_sentiment_weights()
     
     def load_sentiment_weights(self):
-        """Load dynamic sentiment weights from analysis"""
+        """Load enhanced sentiment weights from analysis"""
         try:
-            with open("word_analysis_results.json", 'r') as f:
+            # Try enhanced results first
+            with open("enhanced_analysis_results.json", 'r') as f:
                 results = json.load(f)
-                return results.get('sentiment_weights', {})
+                weights = results.get('sentiment_weights', {})
+                logger.info(f"Loaded {len(weights)} enhanced sentiment weights")
+                return weights
         except FileNotFoundError:
-            logger.warning("No word analysis results found, using basic sentiment")
-            return {}
+            try:
+                # Fallback to original results
+                with open("word_analysis_results.json", 'r') as f:
+                    results = json.load(f)
+                    weights = results.get('sentiment_weights', {})
+                    logger.info(f"Loaded {len(weights)} original sentiment weights")
+                    return weights
+            except FileNotFoundError:
+                logger.warning("No sentiment analysis results found, using basic sentiment")
+                return {}
     
     def calculate_dynamic_sentiment(self, text):
-        """Calculate sentiment using learned weights"""
+        """Calculate sentiment using enhanced learned weights"""
         if not self.sentiment_weights:
             return 0
         
-        words = text.split()
-        sentiment_score = 0  # Initialize sentiment_score
+        # Use the enhanced processor's method if available
+        if hasattr(self.enhanced_processor, 'calculate_enhanced_sentiment'):
+            try:
+                enhanced_results = self.enhanced_processor.calculate_enhanced_sentiment(text)
+                return enhanced_results.get('combined', 0)
+            except Exception as e:
+                logger.warning(f"Enhanced sentiment calculation failed: {e}")
+        
+        # Fallback to improved keyword-based calculation
+        return self._calculate_improved_keyword_sentiment(text)
+
+    def _calculate_improved_keyword_sentiment(self, text):
+        """Improved keyword-based sentiment with negation handling"""
+        if not text or not self.sentiment_weights:
+            return 0
+        
+        negation_words = {'not', 'no', 'never', "n't", 'none', 'cannot', 'won\'t', 'don\'t', 'isn\'t', 'aren\'t'}
+        words = re.findall(r'\b\w+\b', text.lower())
+        
+        total_score = 0
         total_weight = 0
         
-        for word in words:
+        i = 0
+        while i < len(words):
+            # Check for negation in preceding 3 words
+            negated = any(w in negation_words for w in words[max(0, i-3):i])
+            
+            # Check bigrams first (higher priority)
+            if i < len(words) - 1:
+                bigram = f"{words[i]} {words[i+1]}"
+                if bigram in self.sentiment_weights:
+                    weight_info = self.sentiment_weights[bigram]
+                    score = weight_info['weight'] * weight_info['confidence']
+                    if negated:
+                        score *= -0.8  # Slightly reduce negation impact
+                    total_score += score
+                    total_weight += weight_info['confidence']
+                    i += 2
+                    continue
+            
+            # Check individual words
+            word = words[i]
             if word in self.sentiment_weights:
-                weight = self.sentiment_weights[word]['weight']
-                confidence = self.sentiment_weights[word]['confidence']
-                sentiment_score += weight * confidence
-                total_weight += confidence
+                weight_info = self.sentiment_weights[word]
+                score = weight_info['weight'] * weight_info['confidence']
+                if negated:
+                    score *= -0.8
+                total_score += score
+                total_weight += weight_info['confidence']
+            
+            i += 1
         
-        # Check bigrams
-        for i in range(len(words) - 1):
-            bigram = f"{words[i]} {words[i+1]}"
-            if bigram in self.sentiment_weights:
-                weight = self.sentiment_weights[bigram]['weight']
-                confidence = self.sentiment_weights[bigram]['confidence']
-                sentiment_score += weight * confidence * 1.5  # Boost bigrams
-                total_weight += confidence
+        if total_weight == 0:
+            return 0
         
-        return sentiment_score / (total_weight + 1e-6)  # Avoid division by zero
+        normalized_score = total_score / total_weight
+        return max(-1, min(1, normalized_score))  # Clamp to [-1, 1]
     
     def _create_session(self):
         session = requests.Session()
@@ -329,6 +377,11 @@ class NewsProcessor:
         
         now = datetime.now()
         s = s.strip().lower()
+
+        # Handle explicit "15 min" style
+        if re.match(r"^\d+\s*min$", s):
+            minutes = int(re.findall(r"\d+", s)[0])
+            return (now - timedelta(minutes=minutes)).replace(second=0, microsecond=0)
         
         # Better handling of relative dates
         if s.startswith("today"):
@@ -359,14 +412,14 @@ class NewsProcessor:
                 parsed = datetime.strptime(s, fmt)
                 if parsed.year == 1900:
                     parsed = parsed.replace(year=now.year)
-                # If no time specified, assume market open
                 if parsed.hour == 0 and parsed.minute == 0:
                     parsed = parsed.replace(hour=9, minute=30)
                 return parsed
             except ValueError:
                 continue
+        
         return None
-    
+
     def preprocess_text(self, text):
         if not text:
             return ""
@@ -513,13 +566,33 @@ class NewsProcessor:
             
             mentions, pos_kw, neg_kw, tokens = self.extract_mentions_and_sentiment(article_text, ticker)
             
-            # Use enhanced sentiment analysis
+            # --- ENHANCED SENTIMENT SCORING ---
             full_text = f"{headline} {article_text}"
             enhanced_sentiment = self.enhanced_processor.calculate_enhanced_sentiment(full_text)
             
+            ml_prediction = 0.5
+            if hasattr(self.sentiment_learner, 'predict_sentiment') and self.sentiment_learner.sentiment_model:
+                try:
+                    ml_prediction = self.sentiment_learner.predict_sentiment(full_text)
+                except Exception as e:
+                    logger.debug(f"ML prediction failed: {e}")
+
+            sentiment_combined_score = enhanced_sentiment.get('combined', 0)
+            prediction_confidence = abs(sentiment_combined_score)
+
+            # More nuanced categorization based on confidence
+            if sentiment_combined_score > 0.1 and prediction_confidence > 0.3:
+                sentiment_category = "Bullish"
+            elif sentiment_combined_score < -0.1 and prediction_confidence > 0.3:
+                sentiment_category = "Bearish"
+            elif prediction_confidence > 0.5:
+                sentiment_category = "Strong Neutral"
+            else:
+                sentiment_category = "Weak Signal"
+
             price_data = self.get_price_data(ticker, parsed_dt)
             
-            # Article entry with tokens included
+            # Article entry with enhanced features
             article_entry = {
                 "ticker": ticker,
                 "datetime": cols[0].get_text(strip=True),
@@ -528,18 +601,24 @@ class NewsProcessor:
                 "text": article_text,
                 "tokens": tokens,
                 
-                # Sentiment signals
+                # Enhanced sentiment signals
                 "sentiment_dynamic": enhanced_sentiment.get('dynamic_weights', 0),
-                "sentiment_ml": enhanced_sentiment.get('ml_prediction', 0),
+                "sentiment_ml": ml_prediction,
                 "sentiment_keyword": enhanced_sentiment.get('keyword_based', 0),
-                "sentiment_combined": enhanced_sentiment.get('combined', 0),
-                "prediction_confidence": abs(enhanced_sentiment.get('combined', 0)),
+                "sentiment_combined": sentiment_combined_score,
+                "prediction_confidence": prediction_confidence,
+                "sentiment_category": sentiment_category,
                 
                 # Additional extracted features
                 "mentions": ', '.join(mentions) if mentions else '',
                 "pos_keywords": ', '.join(pos_kw) if pos_kw else '',
                 "neg_keywords": ', '.join(neg_kw) if neg_kw else '',
-                "total_keywords": len(pos_kw) + len(neg_kw)
+                "total_keywords": len(pos_kw) + len(neg_kw),
+                
+                # Text analysis features
+                "text_length": len(article_text.split()),
+                "headline_sentiment": self.calculate_dynamic_sentiment(headline),
+                "keyword_density": (len(pos_kw) + len(neg_kw)) / len(article_text.split()) if article_text else 0
             }
             
             # Add price data if available
@@ -592,7 +671,7 @@ class NewsProcessor:
                 continue
         
         return tickers_with_news
-    
+
 def init_database():
     """Create (or patch) a lean 'articles' table that matches the minimal feature set."""
     conn = sqlite3.connect(CONFIG["DB_PATH"])
@@ -600,93 +679,102 @@ def init_database():
 
     # ── keep only what the slim FE produces ──────────────────────────────
     all_required_columns = {
-    "ticker": "TEXT",
-    "datetime": "TEXT",
-    "headline": "TEXT",
-    "url": "TEXT",
-    "text": "TEXT",
-    "tokens": "TEXT",
-    "sentiment_dynamic": "REAL",
-    "sentiment_ml": "REAL",
-    "sentiment_keyword": "REAL",
-    "sentiment_combined": "REAL",
-    "prediction_confidence": "REAL",
-    "mentions": "TEXT",
-    "pos_keywords": "TEXT",
-    "neg_keywords": "TEXT",
-    "total_keywords": "INTEGER",
+        "ticker": "TEXT",
+        "datetime": "TEXT",
+        "headline": "TEXT",
+        "url": "TEXT",
+        "text": "TEXT",
+        "tokens": "TEXT",
+        "sentiment_dynamic": "REAL",
+        "sentiment_ml": "REAL",
+        "sentiment_keyword": "REAL",
+        "sentiment_combined": "REAL",
+        "prediction_confidence": "REAL",
+        "mentions": "TEXT",
+        "pos_keywords": "TEXT",
+        "neg_keywords": "TEXT",
+        "total_keywords": "INTEGER",
 
-    # price changes and directions
-    "pct_change_1h": "REAL",
-    "pct_change_4h": "REAL",
-    "pct_change_eod": "REAL",
-    "pct_change_eow": "REAL",
-    "direction_1h": "TEXT",
-    "direction_4h": "TEXT",
-    "direction_eod": "TEXT",
-    "direction_eow": "TEXT",
+        # price changes and directions
+        "pct_change_1h": "REAL",
+        "pct_change_4h": "REAL",
+        "pct_change_eod": "REAL",
+        "pct_change_eow": "REAL",
+        "direction_1h": "TEXT",
+        "direction_4h": "TEXT",
+        "direction_eod": "TEXT",
+        "direction_eow": "TEXT",
+        "sentiment_category": "TEXT", # New field
 
-    # time-based features
-    "day_of_week": "INTEGER",
-    "hour_of_day": "INTEGER",
-    "day_of_month": "INTEGER",
-    "month": "INTEGER",
-    "quarter": "INTEGER",
-    "year": "INTEGER",
-    "is_weekend": "BOOLEAN",
-    "is_market_hours": "BOOLEAN",
-    "is_premarket": "BOOLEAN",
-    "is_aftermarket": "BOOLEAN",
-    "is_opening_hour": "BOOLEAN",
-    "is_closing_hour": "BOOLEAN",
+        # time-based features
+        "day_of_week": "INTEGER",
+        "hour_of_day": "INTEGER",
+        "day_of_month": "INTEGER",
+        "month": "INTEGER",
+        "quarter": "INTEGER",
+        "year": "INTEGER",
+        "is_weekend": "BOOLEAN",
+        "is_market_hours": "BOOLEAN",
+        "is_premarket": "BOOLEAN",
+        "is_aftermarket": "BOOLEAN",
+        "is_opening_hour": "BOOLEAN",
+        "is_closing_hour": "BOOLEAN",
 
-    # cyclical features
-    "hour_sin": "REAL",
-    "hour_cos": "REAL",
-    "day_sin": "REAL",
-    "day_cos": "REAL",
+        # cyclical features
+        "hour_sin": "REAL",
+        "hour_cos": "REAL",
+        "day_sin": "REAL",
+        "day_cos": "REAL",
 
-    # advanced sentiment
-    "sentiment_combined_strength": "REAL",
-    "sentiment_combined_positive": "REAL",
-    "sentiment_combined_negative": "REAL",
-    "sentiment_combined_neutral": "REAL",
-    "sentiment_combined_very_positive": "REAL",
-    "sentiment_combined_very_negative": "REAL",
-    "sentiment_combined_confidence": "REAL",
+        # advanced sentiment
+        "sentiment_combined_strength": "REAL",
+        "sentiment_combined_positive": "REAL",
+        "sentiment_combined_negative": "REAL",
+        "sentiment_combined_neutral": "REAL",
+        "sentiment_combined_very_positive": "REAL",
+        "sentiment_combined_very_negative": "REAL",
+        "sentiment_combined_confidence": "REAL",
+        "sentiment_score": "REAL",
 
-    # derived movement features
-    "pct_change_1h_abs": "REAL",
-    "pct_change_1h_positive": "BOOLEAN",
-    "pct_change_1h_negative": "BOOLEAN",
-    "pct_change_1h_significant": "BOOLEAN",
-    "pct_change_4h_abs": "REAL",
-    "pct_change_4h_positive": "BOOLEAN",
-    "pct_change_4h_negative": "BOOLEAN",
-    "pct_change_4h_significant": "BOOLEAN",
-    "pct_change_eod_abs": "REAL",
-    "pct_change_eod_positive": "BOOLEAN",
-    "pct_change_eod_negative": "BOOLEAN",
-    "pct_change_eod_significant": "BOOLEAN",
-    "pct_change_eow_abs": "REAL",
-    "pct_change_eow_positive": "BOOLEAN",
-    "pct_change_eow_negative": "BOOLEAN",
-    "pct_change_eow_significant": "BOOLEAN",
+        # New columns for advanced features
+        "text_length": "INTEGER",
+        "headline_sentiment": "REAL",
+        "keyword_density": "REAL",
+        "ml_confidence": "REAL",
+        "sentiment_strength": "REAL",
+        
+        # derived movement features
+        "pct_change_1h_abs": "REAL",
+        "pct_change_1h_positive": "BOOLEAN",
+        "pct_change_1h_negative": "BOOLEAN",
+        "pct_change_1h_significant": "BOOLEAN",
+        "pct_change_4h_abs": "REAL",
+        "pct_change_4h_positive": "BOOLEAN",
+        "pct_change_4h_negative": "BOOLEAN",
+        "pct_change_4h_significant": "BOOLEAN",
+        "pct_change_eod_abs": "REAL",
+        "pct_change_eod_positive": "BOOLEAN",
+        "pct_change_eod_negative": "BOOLEAN",
+        "pct_change_eod_significant": "BOOLEAN",
+        "pct_change_eow_abs": "REAL",
+        "pct_change_eow_positive": "BOOLEAN",
+        "pct_change_eow_negative": "BOOLEAN",
+        "pct_change_eow_significant": "BOOLEAN",
 
-    # target labels
-    "target_pct_change_1h_up_0_02": "BOOLEAN",
-    "target_pct_change_1h_down_0_02": "BOOLEAN",
-    "target_pct_change_1h_direction_0_02": "TEXT",
-    "target_pct_change_4h_up_0_02": "BOOLEAN",
-    "target_pct_change_4h_down_0_02": "BOOLEAN",
-    "target_pct_change_4h_direction_0_02": "TEXT",
-    "target_pct_change_eod_up_0_02": "BOOLEAN",
-    "target_pct_change_eod_down_0_02": "BOOLEAN",
-    "target_pct_change_eod_direction_0_02": "TEXT",
-    "target_pct_change_eow_up_0_02": "BOOLEAN",
-    "target_pct_change_eow_down_0_02": "BOOLEAN",
-    "target_pct_change_eow_direction_0_02": "TEXT"
-}
+        # target labels
+        "target_pct_change_1h_up_0_02": "BOOLEAN",
+        "target_pct_change_1h_down_0_02": "BOOLEAN",
+        "target_pct_change_1h_direction_0_02": "TEXT",
+        "target_pct_change_4h_up_0_02": "BOOLEAN",
+        "target_pct_change_4h_down_0_02": "BOOLEAN",
+        "target_pct_change_4h_direction_0_02": "TEXT",
+        "target_pct_change_eod_up_0_02": "BOOLEAN",
+        "target_pct_change_eod_down_0_02": "BOOLEAN",
+        "target_pct_change_eod_direction_0_02": "TEXT",
+        "target_pct_change_eow_up_0_02": "BOOLEAN",
+        "target_pct_change_eow_down_0_02": "BOOLEAN",
+        "target_pct_change_eow_direction_0_02": "TEXT"
+    }
     # ─────────────────────────────────────────────────────────────────────
 
     # does the table already exist?
@@ -704,7 +792,7 @@ def init_database():
                 )
                 logger.info(f"Added column: {col}")
     else:
-        # brand‑new table
+        # brand-new table
         column_defs = ", ".join(f"{c} {t}" for c, t in all_required_columns.items())
         cursor.execute(f"CREATE TABLE articles ({column_defs})")
         logger.info("Created new, slim articles table")
@@ -713,88 +801,67 @@ def init_database():
     conn.close()
 
 def save_articles(articles):
-    """Save articles to both CSV and database with proper error handling"""
+    """Save articles to both CSV and database with proper error handling."""
     if not articles:
         logger.warning("No articles to save")
         return
 
     df = pd.DataFrame(articles)
-    logger.info(f"Processing {len(df)} articles for saving")
-
-    # Save to CSV
+    logger.info(f"Processing {len(df)} articles for saving...")
+    
+    # --- Unified CSV Saving Logic ---
     try:
-        if os.path.exists(CONFIG['CSV_OUTPUT']):
-            existing_df = pd.read_csv(CONFIG['CSV_OUTPUT'])
-            # Check for duplicates before combining
-            existing_urls = set(existing_df['url'].tolist()) if 'url' in existing_df.columns else set()
-            new_articles_df = df[~df['url'].isin(existing_urls)]
+        output_file = CONFIG['CSV_OUTPUT']
+        if os.path.exists(output_file):
+            existing_df = pd.read_csv(output_file)
+            new_df = df[~df['url'].isin(existing_df['url'])]
             
-            if not new_articles_df.empty:
-                combined_df = pd.concat([existing_df, new_articles_df], ignore_index=True)
-                combined_df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
-                logger.info(f"Added {len(new_articles_df)} new articles to existing CSV")
+            if not new_df.empty:
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                combined_df.to_csv(output_file, index=False)
+                logger.info(f"Appended {len(new_df)} new articles to {output_file}")
             else:
-                logger.info("No new articles to add to CSV (all duplicates)")
+                logger.info("No new unique articles to add to CSV.")
         else:
-            df.to_csv(CONFIG['CSV_OUTPUT'], index=False)
-            logger.info(f"Created new CSV with {len(df)} articles")
+            df.to_csv(output_file, index=False)
+            logger.info(f"Created new CSV {output_file} with {len(df)} articles")
     except Exception as e:
         logger.error(f"Error saving to CSV: {e}")
 
-    # Save to database
-    conn = sqlite3.connect(CONFIG['DB_PATH'])
+    # --- Unified Database Saving Logic ---
+    conn = None
     try:
-        # Check for existing articles by URL
-        try:
-            existing_urls_query = "SELECT url FROM articles WHERE url IS NOT NULL"
-            existing_urls = pd.read_sql(existing_urls_query, conn)["url"].tolist()
-            new_articles_df = df[~df["url"].isin(existing_urls)]
-            logger.info(f"Found {len(existing_urls)} existing URLs, {len(new_articles_df)} new articles to insert")
-        except Exception as e:
-            logger.warning(f"Could not check existing URLs, inserting all: {e}")
-            new_articles_df = df
-        
-        if not new_articles_df.empty:
-            # Fill NaN values with appropriate defaults before inserting
-            new_articles_filled = new_articles_df.fillna({
-                'text': '',
-                'tokens': '',
-                'mentions': '',
-                'pos_keywords': '',
-                'neg_keywords': '',
-                'total_keywords': 0,
-                'sentiment_dynamic': 0.0,
-                'sentiment_ml': 0.0,
-                'sentiment_keyword': 0.0,
-                'sentiment_combined': 0.0,
-                'prediction_confidence': 0.0,
-                'pct_change_1h': 0.0,    
-                'pct_change_4h': 0.0,    
-                'pct_change_eod': 0.0,   
-                'pct_change_eow': 0.0,   
-                'direction_1h': 'No Data',
-                'direction_4h': 'No Data',
-                'direction_eod': 'No Data',
-                'direction_eow': 'No Data'
-            })
+        conn = sqlite3.connect(CONFIG['DB_PATH'])
+        # Use the same 'new_df' from the CSV logic if available, otherwise check DB
+        # For simplicity and robustness, we re-check against the DB state.
+        existing_urls_query = "SELECT url FROM articles WHERE url IS NOT NULL"
+        existing_urls = pd.read_sql(existing_urls_query, conn)["url"].tolist()
+        new_to_db_df = df[~df["url"].isin(existing_urls)]
 
-            # Insert into database
+        if not new_to_db_df.empty:
+            # Your original fillna logic is good
+            new_articles_filled = new_to_db_df.fillna({
+                'text': '', 'tokens': '', 'mentions': '', 'pos_keywords': '',
+                'neg_keywords': '', 'total_keywords': 0, 'sentiment_dynamic': 0.0,
+                'sentiment_ml': 0.0, 'sentiment_keyword': 0.0, 'sentiment_combined': 0.0,
+                'prediction_confidence': 0.0, 'sentiment_category': 'Neutral',
+                'text_length': 0, 'headline_sentiment': 0.0, 'keyword_density': 0.0,
+                'ml_confidence': 0.0, 'sentiment_strength': 0.0, 'pct_change_1h': 0.0,
+                'pct_change_4h': 0.0, 'pct_change_eod': 0.0, 'pct_change_eow': 0.0,
+                'direction_1h': 'No Data', 'direction_4h': 'No Data',
+                'direction_eod': 'No Data', 'direction_eow': 'No Data'
+            })
             new_articles_filled.to_sql("articles", conn, if_exists="append", index=False)
             logger.info(f"Successfully inserted {len(new_articles_filled)} new articles into database")
-            
-            # Show some statistics
-            show_article_statistics(new_articles_filled)
-            
+            show_article_statistics(new_articles_filled) # Call stats on the newly added data
         else:
-            logger.info("No new articles to insert into database (all duplicates)")
-
+            logger.info("No new articles to insert into database (all duplicates).")
     except Exception as e:
         logger.error(f"Error saving articles to database: {e}")
-        # Print more details about the error
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
+        logger.error(traceback.format_exc())
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 def show_article_statistics(df):
     """Show statistics about the processed articles"""
@@ -831,14 +898,92 @@ def show_article_statistics(df):
             neg_sentiment = (sentiment_scores < 0).sum()
             logger.info(f"Sentiment: avg={avg_sentiment:.3f}, positive={pos_sentiment}, negative={neg_sentiment}")
 
+def run_enhanced_sentiment_training():
+    """Train the enhanced sentiment model before processing new articles"""
+    logger.info("Training enhanced sentiment model...")
+    
+    try:
+        # Import the enhanced training function
+        from word_analysis_framework import run_sentiment_analysis
+        
+        # Run enhanced analysis
+        results = run_sentiment_analysis()
+        
+        if results and results.get('model_performance', {}).get('model_trained'):
+            performance = results['model_performance']
+            logger.info(f"Enhanced model trained successfully:")
+            logger.info(f"  - Model: {performance.get('best_model', 'Unknown')}")
+            logger.info(f"  - Accuracy: {performance.get('test_accuracy', 0):.4f}")
+            logger.info(f"  - F1-Score: {performance.get('test_f1', 0):.4f}")
+            return True
+        else:
+            logger.warning("Enhanced model training failed, using existing model")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Enhanced sentiment training failed: {e}")
+        return False
+
+# === NEW UNIFIED SAVE FUNCTION ===
+def save_synchronized_files(raw_df, engineered_df):
+    """
+    Saves both raw and engineered data to their respective CSVs,
+    ensuring they remain perfectly in sync by using the same duplicate check.
+    """
+    if raw_df.empty:
+        logger.warning("Received empty raw dataframe, nothing to save.")
+        return
+
+    # --- Save scraped_articles.csv (Raw Data) ---
+    raw_output_file = "scraped_articles.csv"
+    try:
+        new_raw_df = raw_df
+        if os.path.exists(raw_output_file):
+            existing_raw_df = pd.read_csv(raw_output_file)
+            new_raw_df = raw_df[~raw_df['url'].isin(existing_raw_df['url'])]
+            if not new_raw_df.empty:
+                combined_df = pd.concat([existing_raw_df, new_raw_df], ignore_index=True)
+                combined_df.to_csv(raw_output_file, index=False)
+        else:
+            new_raw_df.to_csv(raw_output_file, index=False)
+        
+        if not new_raw_df.empty:
+            logger.info(f"Saved/Appended {len(new_raw_df)} new rows to {raw_output_file}")
+
+    except Exception as e:
+        logger.error(f"Error saving to {raw_output_file}: {e}")
+
+    # --- Save cleaned_engineered_features.csv (Engineered Data) ---
+    # Only proceed if there were new raw articles to add
+    if not new_raw_df.empty and not engineered_df.empty:
+        engineered_output_file = "cleaned_engineered_features.csv"
+        try:
+            # Filter the engineered data to only include the newly added raw articles
+            new_engineered_df = engineered_df[engineered_df['url'].isin(new_raw_df['url'])]
+            
+            if os.path.exists(engineered_output_file):
+                existing_eng_df = pd.read_csv(engineered_output_file)
+                if not new_engineered_df.empty:
+                    combined_df = pd.concat([existing_eng_df, new_engineered_df], ignore_index=True)
+                    combined_df.to_csv(engineered_output_file, index=False)
+            else:
+                new_engineered_df.to_csv(engineered_output_file, index=False)
+            
+            if not new_engineered_df.empty:
+                logger.info(f"Saved/Appended {len(new_engineered_df)} new rows to {engineered_output_file}")
+
+        except Exception as e:
+            logger.error(f"Error saving to {engineered_output_file}: {e}")
+
 # Main execution logic
 def main():
     """Main execution function using pre-filtered tickers"""
     print("MAIN FUNCTION STARTED")
     logger.info("Starting News Sentiment Analysis Pipeline")
-
+    
     try:
         init_database()
+        
         processor = NewsProcessor()
 
         # Try to get pre-filtered tickers first
@@ -853,7 +998,6 @@ def main():
         
         if not filtered_tickers:
             logger.warning("No pre-filtered tickers found. Using fallback method...")
-            # Fallback to original method
             all_tickers = sorted(list(processor.valid_tickers))
             if CONFIG['MAX_TICKERS']:
                 all_tickers = all_tickers[:CONFIG['MAX_TICKERS']]
@@ -870,11 +1014,9 @@ def main():
             logger.error("No tickers with news found")
             return
 
-        # REMOVE THE TESTING LIMITATION - Process up to MAX_TICKERS
         if total_tickers > CONFIG['MAX_TICKERS']:
-            # Randomly sample for better diversity instead of just taking first N
             import random
-            random.shuffle(filtered_tickers)  # Shuffle for random sampling
+            random.shuffle(filtered_tickers)
             filtered_tickers = filtered_tickers[:CONFIG['MAX_TICKERS']]
             total_tickers = CONFIG['MAX_TICKERS']
             logger.info(f"Randomly sampled {total_tickers} tickers from available pool")
@@ -913,14 +1055,12 @@ def main():
                     
                     processed_count += 1
                     
-                    # Progress update every 10 tickers
                     if processed_count % 10 == 0:
                         logger.info(f"Progress: {processed_count}/{total_tickers} tickers processed, "
-                                  f"{len(all_articles + batch_articles)} total articles collected")
+                                    f"{len(all_articles + batch_articles)} total articles collected")
                     
-                    # Rate limiting - slightly faster for larger batches
                     if i < len(batch_tickers):
-                        sleep_time = random.uniform(1.5, 3.0)  # Reduced from 2-4s
+                        sleep_time = random.uniform(1.5, 3.0)
                         time.sleep(sleep_time)
 
                 except Exception as e:
@@ -928,51 +1068,45 @@ def main():
                     logger.error(f"Failed to process ticker {ticker}: {e}")
                     continue
             
-            # Add batch articles to total
             all_articles.extend(batch_articles)
             logger.info(f"Batch {batch_num + 1} completed: {len(batch_articles)} articles")
             
-            # Save progress after each batch (in case of interruption)
+            # Save progress and retrain after each batch
             if batch_articles:
                 try:
-                    df_batch = pd.DataFrame(all_articles)
-                    df_batch = feature_engineering_pipeline(df_batch)
-                    save_articles(df_batch.to_dict(orient="records"))
-                    logger.info(f"Progress saved: {len(all_articles)} total articles")
+                    # Step 1: Create the engineer and process the batch data
+                    engineer = FinancialNewsFeatureEngineer()
+                    df_processed = engineer.feature_engineering_pipeline(pd.DataFrame(batch_articles))
+
+                    # Step 2: Save the PROCESSED DataFrame
+                    if not df_processed.empty:
+                        save_articles(df_processed.to_dict(orient="records"))
+                        logger.info(f"Progress saved for batch: {len(df_processed)} articles")
+
+                        # Step 3: Retrain the model with the newly available data
+                        logger.info(f"Retraining sentiment model after batch {batch_num + 1}/{total_batches}...")
+                        run_enhanced_sentiment_training()
+                    else:
+                        logger.warning("Feature engineering resulted in an empty DataFrame for this batch. Skipping save and retrain.")
+
                 except Exception as e:
-                    logger.warning(f"Failed to save batch progress: {e}")
-            
+                    logger.warning(f"Failed to save or retrain after batch: {e}")
+
             # Longer pause between batches to avoid rate limiting
             if batch_num < total_batches - 1:
                 logger.info("Pausing 30 seconds between batches...")
                 time.sleep(30)
-
-        # Final processing and saving
+            
+        # Final Summary
         if all_articles:
             logger.info(f"Collection completed: {len(all_articles)} articles from {processed_count} tickers")
-            logger.info(f"Success rate: {((processed_count - error_count) / processed_count * 100):.1f}%")
+            if processed_count > 0:
+                logger.info(f"Success rate: {((processed_count - error_count) / processed_count * 100):.1f}%")
             
-            # Final feature engineering and save
-            df = pd.DataFrame(all_articles)
-            try:
-                df = feature_engineering_pipeline(df)
-                logger.info("Final feature engineering completed")
-            except Exception as e:
-                logger.warning(f"Feature engineering failed: {e}")
-                # Add minimal required columns as fallback
-                for col in ['day_of_week', 'hour_of_day', 'is_weekend']:
-                    if col not in df.columns:
-                        df[col] = 0
-                
-            save_articles(df.to_dict(orient="records"))
-            
-            # Show final statistics
             logger.info("=== FINAL STATISTICS ===")
             logger.info(f"Tickers processed: {processed_count}")
             logger.info(f"Errors encountered: {error_count}")
             logger.info(f"Total articles collected: {len(all_articles)}")
-            logger.info(f"Average articles per ticker: {len(all_articles)/processed_count:.1f}")
-            logger.info(f"Unique tickers with articles: {df['ticker'].nunique()}")
             
             logger.info("Pipeline completed successfully")
         else:
@@ -987,4 +1121,3 @@ if __name__ == "__main__":
     print("Script started, calling main()")
     main()
     print("Script completed")
-
