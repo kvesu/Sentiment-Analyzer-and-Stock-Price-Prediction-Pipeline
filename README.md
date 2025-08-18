@@ -1,1 +1,1 @@
-# Sentiment-Analyzer-IST495
+# Sentiment Analyzer and Stock Price Prediction Pipeline
