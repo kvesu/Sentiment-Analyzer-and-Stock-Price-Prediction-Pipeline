@@ -100,10 +100,8 @@ class PredictionScreener:
         
         # EOD predictions filtering with market hours consideration
         if self.horizon == 'eod':
-            self.predictions_df['news_date_utc'] = self.predictions_df['news_datetime'].dt.date
             self.predictions_df['news_et'] = self.predictions_df['news_datetime'].dt.tz_convert('US/Eastern')
             
-            # Market closes at 4:00 PM ET (16:00)
             market_close_hour = 16
             
             # Initialize counters for detailed reporting
@@ -111,54 +109,42 @@ class PredictionScreener:
             after_hours_count = 0
             weekend_count = 0
             market_still_open_count = 0
-            viable_count = 0
             
             viable_indices = []
             
+            # --- START OF CORRECTED LOGIC ---
             for idx, row in self.predictions_df.iterrows():
-                news_date = row['news_date_utc']
-                news_et_time = row['news_et']
-                is_viable = False
+                news_et = row['news_et']
                 
-                # Future dates are never viable
-                if news_date > current_date_utc:
-                    future_count += 1
-                    continue
+                # Determine the date of the market close needed to verify this prediction
+                target_close_date = news_et.date()
                 
-                # Past dates (before today) are always viable
-                if news_date < current_date_utc:
-                    is_viable = True
-                    viable_count += 1
-                
-                # Today's date - check market hours
-                elif news_date == current_date_utc:
-                    # Check if it's a weekday (Monday=0, Sunday=6)
-                    weekday = current_et.weekday()
-                    
-                    # Weekend articles need next trading day
-                    if weekday >= 5:  # Saturday or Sunday
-                        weekend_count += 1
-                        continue
-                    
-                    # Weekday - check if article was after market close (4:00 PM ET)
-                    if news_et_time.hour >= market_close_hour:
-                        # After hours article needs next trading day
-                        after_hours_count += 1
-                        continue
-                    
-                    # Article was during market hours today
-                    # Check if we're currently past market close
-                    if current_et.hour >= market_close_hour:
-                        # Market has closed, so we can calculate today's EOD change
-                        is_viable = True
-                        viable_count += 1
-                    else:
-                        # Market is still open, need to wait for close
-                        market_still_open_count += 1
-                        continue
-                
-                if is_viable:
+                # If news is after market close (4 PM ET) or on a weekend, the target is the next trading day
+                if news_et.hour >= market_close_hour or news_et.weekday() >= 5:
+                    # Start looking from the next day
+                    next_day = news_et.date() + timedelta(days=1)
+                    # Find the next weekday (this is a simple proxy for the next trading day)
+                    while next_day.weekday() >= 5:
+                        next_day += timedelta(days=1)
+                    target_close_date = next_day
+
+                # The prediction is viable ONLY if the current date is past the target close date,
+                # OR if it's the same day and the market has already closed.
+                if current_et.date() > target_close_date:
                     viable_indices.append(idx)
+                elif current_et.date() == target_close_date and current_et.hour >= market_close_hour:
+                    viable_indices.append(idx)
+                else:
+                    # If not viable, categorize why for reporting
+                    if news_et.date() > current_et.date():
+                        future_count += 1
+                    elif news_et.weekday() >= 5:
+                        weekend_count += 1
+                    elif news_et.hour >= market_close_hour:
+                        after_hours_count += 1
+                    else: # Must be a prediction from today where the market is still open
+                        market_still_open_count += 1
+            # --- END OF CORRECTED LOGIC ---
             
             # Filter the dataframe using the viable indices
             viable_df = self.predictions_df.loc[viable_indices].copy()
@@ -184,7 +170,7 @@ class PredictionScreener:
                 print("All predictions need future market data or market close.")
                 return False
         
-        # For intraday horizons, keep the existing time-based logic
+        # For intraday horizons, keep the existing time-based logic (this part was already correct)
         elif self.horizon in ['1hr', '4hr']:
             time_delta = timedelta(hours=1) if self.horizon == '1hr' else timedelta(hours=4)
             current_time_utc = datetime.now(pytz.UTC)
