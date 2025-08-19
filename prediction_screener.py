@@ -80,10 +80,38 @@ class PredictionScreener:
         print(f"Loaded {len(self.predictions_df)} valid predictions.")
         return True
 
+    def get_target_close_date(self, news_et):
+        """
+        Helper function to determine which trading day's close a news item should predict.
+        This logic is shared between filtering and calculation.
+        """
+        market_open_hour = 9   # 9:30 AM ET (simplified to 9 AM for safety)
+        market_close_hour = 16 # 4:00 PM ET
+        
+        # If news is during market hours (9 AM - 4 PM ET on a weekday), predict same day's close
+        if (news_et.weekday() < 5 and 
+            market_open_hour <= news_et.hour < market_close_hour):
+            return news_et.date()
+        
+        # If news is outside market hours or on weekend, predict next trading day's close
+        # This includes: before 9 AM, after 4 PM, or weekends
+        
+        # Start looking from the next day if it's after market close
+        if (news_et.weekday() < 5 and news_et.hour >= market_close_hour):
+            next_day = news_et.date() + timedelta(days=1)
+        # For pre-market or weekend news, target is same day if weekday, otherwise next weekday
+        else:
+            next_day = news_et.date() if news_et.weekday() < 5 else news_et.date() + timedelta(days=1)
+        
+        # Find the next weekday (simple proxy for next trading day)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        return next_day
+
     def filter_viable_predictions(self):
         """
         Filters out predictions that cannot be calculated due to missing future market data.
-        For EOD predictions, we need the next trading day's close.
+        For EOD predictions, we need the target trading day's close.
         This now happens BEFORE averaging to avoid losing all data.
         """
         print("\nFiltering for viable predictions (before averaging)...")
@@ -112,39 +140,58 @@ class PredictionScreener:
             
             viable_indices = []
             
-            # --- START OF CORRECTED LOGIC ---
+            # Add diagnostic counters
+            total_after_hours = 0
+            total_viable_after_hours = 0
+            sample_diagnostics = []
+            
             for idx, row in self.predictions_df.iterrows():
                 news_et = row['news_et']
                 
-                # Determine the date of the market close needed to verify this prediction
-                target_close_date = news_et.date()
+                # Check if this is after-hours for diagnostics
+                is_after_hours = (news_et.weekday() >= 5 or  # Weekend
+                                news_et.hour >= 16 or        # After close
+                                news_et.hour < 9)            # Before open
                 
-                # If news is after market close (4 PM ET) or on a weekend, the target is the next trading day
-                if news_et.hour >= market_close_hour or news_et.weekday() >= 5:
-                    # Start looking from the next day
-                    next_day = news_et.date() + timedelta(days=1)
-                    # Find the next weekday (this is a simple proxy for the next trading day)
-                    while next_day.weekday() >= 5:
-                        next_day += timedelta(days=1)
-                    target_close_date = next_day
+                if is_after_hours:
+                    total_after_hours += 1
+                
+                # Use the shared logic to determine target close date
+                target_close_date = self.get_target_close_date(news_et)
 
                 # The prediction is viable ONLY if the current date is past the target close date,
                 # OR if it's the same day and the market has already closed.
+                is_viable = False
                 if current_et.date() > target_close_date:
-                    viable_indices.append(idx)
+                    is_viable = True
                 elif current_et.date() == target_close_date and current_et.hour >= market_close_hour:
+                    is_viable = True
+                
+                if is_viable:
                     viable_indices.append(idx)
+                    if is_after_hours:
+                        total_viable_after_hours += 1
                 else:
                     # If not viable, categorize why for reporting
                     if news_et.date() > current_et.date():
                         future_count += 1
-                    elif news_et.weekday() >= 5:
+                    elif news_et.weekday() >= 5:  # Weekend
                         weekend_count += 1
-                    elif news_et.hour >= market_close_hour:
+                    elif (news_et.weekday() < 5 and 
+                          (news_et.hour >= 16 or news_et.hour < 9)):  # After hours or pre-market
                         after_hours_count += 1
-                    else: # Must be a prediction from today where the market is still open
+                    else:  # Must be during market hours but market hasn't closed yet
                         market_still_open_count += 1
-            # --- END OF CORRECTED LOGIC ---
+                
+                # Collect sample diagnostics for first 5 after-hours items
+                if is_after_hours and len(sample_diagnostics) < 5:
+                    sample_diagnostics.append({
+                        'ticker': row['ticker'],
+                        'news_et': news_et.strftime('%Y-%m-%d %H:%M ET'),
+                        'target_date': target_close_date.strftime('%Y-%m-%d'),
+                        'is_viable': is_viable,
+                        'why': 'viable' if is_viable else 'needs future data'
+                    })
             
             # Filter the dataframe using the viable indices
             viable_df = self.predictions_df.loc[viable_indices].copy()
@@ -155,7 +202,7 @@ class PredictionScreener:
             if future_count > 0:
                 print(f"  - {future_count} from future dates")
             if after_hours_count > 0:
-                print(f"  - {after_hours_count} from after market close (>4:00 PM ET)")
+                print(f"  - {after_hours_count} from outside market hours (before 9:00 AM or after 4:00 PM ET)")
             if weekend_count > 0:
                 print(f"  - {weekend_count} from weekends")
             if market_still_open_count > 0:
@@ -170,7 +217,7 @@ class PredictionScreener:
                 print("All predictions need future market data or market close.")
                 return False
         
-        # For intraday horizons, keep the existing time-based logic (this part was already correct)
+        # For intraday horizons, keep the existing time-based logic
         elif self.horizon in ['1hr', '4hr']:
             time_delta = timedelta(hours=1) if self.horizon == '1hr' else timedelta(hours=4)
             current_time_utc = datetime.now(pytz.UTC)
@@ -298,6 +345,7 @@ class PredictionScreener:
     def calculate_actual_changes(self):
         """
         Calculates the actual price changes based on the specified horizon.
+        Now properly aligned with filtering logic for after-hours EOD predictions.
         """
         print("\nCalculating actual price changes...")
         actual_changes = []
@@ -314,25 +362,25 @@ class PredictionScreener:
                 market_df = self.market_data[ticker]
                 
                 if self.horizon == 'eod':
-                    # --- EOD Calculation Logic ---
+                    # --- FIXED EOD Calculation Logic ---
                     try:
-                        # Get the news date (convert to date for comparison)
-                        news_date = news_time.date()
+                        # Convert news time to ET for market hours logic
+                        news_et = news_time.astimezone(pytz.timezone('US/Eastern'))
+                        
+                        # Use the same logic as filtering to determine target close date
+                        target_close_date = self.get_target_close_date(news_et)
                         
                         # Find all closes available in our market data
                         available_dates = market_df.index.date
                         unique_dates = sorted(set(available_dates))
                         
-                        # For EOD predictions, we want to match the actual market change:
-                        # Baseline: Previous trading day's close (before news date)
-                        # Target: News date's close (to calculate the actual EOD change that occurred)
-                        
+                        # For EOD predictions, calculate change from previous trading day to target day
                         baseline_close_price = None
                         baseline_date = None
-                        current_close_price = None
+                        target_close_price = None
                         
-                        # Find the last trading day before news date
-                        baseline_candidates = [d for d in unique_dates if d < news_date]
+                        # Find the last trading day before target date for baseline
+                        baseline_candidates = [d for d in unique_dates if d < target_close_date]
                         if baseline_candidates:
                             baseline_date = max(baseline_candidates)
                             baseline_data = market_df[market_df.index.date == baseline_date]
@@ -340,17 +388,17 @@ class PredictionScreener:
                                 baseline_close_price = baseline_data['Close'].iloc[-1]
                                 debug_msg = f"Baseline: {baseline_date}"
                         
-                        # Find the current day's (news date) close
-                        if news_date in unique_dates:
-                            current_day_data = market_df[market_df.index.date == news_date]
-                            if not current_day_data.empty:
-                                current_close_price = current_day_data['Close'].iloc[-1]
-                                debug_msg += f" -> Target: {news_date}"
+                        # Find the target day's close
+                        if target_close_date in unique_dates:
+                            target_day_data = market_df[market_df.index.date == target_close_date]
+                            if not target_day_data.empty:
+                                target_close_price = target_day_data['Close'].iloc[-1]
+                                debug_msg += f" -> Target: {target_close_date}"
                         
                         # Calculate the change
-                        if (pd.notna(baseline_close_price) and pd.notna(current_close_price) and 
+                        if (pd.notna(baseline_close_price) and pd.notna(target_close_price) and 
                             baseline_close_price != 0):
-                            change = (current_close_price - baseline_close_price) / baseline_close_price * 100
+                            change = (target_close_price - baseline_close_price) / baseline_close_price * 100
                             successful_calcs += 1
                             debug_msg += f" -> SUCCESS: {change:.2f}%"
                         else:
@@ -360,7 +408,7 @@ class PredictionScreener:
                         debug_msg = f"Exception: {e}"
 
                 else:
-                    # --- Intraday (1hr/4hr) Calculation ---
+                    # --- Intraday (1hr/4hr) Calculation (unchanged) ---
                     try:
                         time_delta = timedelta(hours=1) if self.horizon == '1hr' else timedelta(hours=4)
                         target_time = news_time + time_delta
