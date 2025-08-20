@@ -13,9 +13,9 @@ CONFIG = {
     'PROGRESS_FILE': "filtering_progress.json",  # NEW: Track progress
     'REFRESH_CACHE': False,  # Set to False to resume from where you left off
     'MAX_TEST_TICKERS': None,  # Set to None to process ALL tickers
-    'BATCH_SIZE': 100,  # Process in batches
+    'BATCH_SIZE': 200,  # Process in batches
     'TIMEOUT': 10,
-    'DELAY_RANGE': (0.5, 1.5),  # Faster delays
+    'DELAY_RANGE': (0.2, 0.5),  # Faster delays
     'SAVE_EVERY': 50,  # Save progress every 50 tickers
 }
 
