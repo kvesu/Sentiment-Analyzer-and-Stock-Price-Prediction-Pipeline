@@ -59,12 +59,16 @@ class PredictionScreener:
             print(f"ERROR: The file '{self.csv_file}' was not found.")
             return False
 
-        # Convert datetime columns and ensure they are timezone-aware (UTC)
+        # Convert datetime columns and ensure they are timezone-aware
         print("Converting datetime columns...")
         self.predictions_df['news_datetime'] = pd.to_datetime(self.predictions_df['news_datetime'])
         
+        # Since your timestamps are already in Eastern Time, localize them as ET first
         if self.predictions_df['news_datetime'].dt.tz is None:
-            self.predictions_df['news_datetime'] = self.predictions_df['news_datetime'].dt.tz_localize('UTC')
+            # Timestamps are in Eastern Time (EST/EDT) - localize them properly
+            self.predictions_df['news_datetime'] = self.predictions_df['news_datetime'].dt.tz_localize('US/Eastern')
+            # Then convert to UTC for internal processing
+            self.predictions_df['news_datetime'] = self.predictions_df['news_datetime'].dt.tz_convert('UTC')
         else:
             self.predictions_df['news_datetime'] = self.predictions_df['news_datetime'].dt.tz_convert('UTC')
         
@@ -79,6 +83,20 @@ class PredictionScreener:
         
         print(f"Loaded {len(self.predictions_df)} valid predictions.")
         return True
+
+    def is_market_hours(self, dt_et):
+        """
+        Check if a datetime (in ET) falls during regular market hours.
+        Market hours: Monday-Friday, 9:30 AM - 4:00 PM ET
+        """
+        if dt_et.weekday() >= 5:  # Weekend
+            return False
+        
+        # Convert to decimal hours for easier comparison
+        hour_decimal = dt_et.hour + dt_et.minute/60
+        
+        # Market is open 9:30 AM to 4:00 PM ET (9.5 to 16.0 in decimal)
+        return 9.5 <= hour_decimal < 16.0
 
     def get_target_close_date(self, news_et):
         """
@@ -111,8 +129,7 @@ class PredictionScreener:
     def filter_viable_predictions(self):
         """
         Filters out predictions that cannot be calculated due to missing future market data.
-        For EOD predictions, we need the target trading day's close.
-        This now happens BEFORE averaging to avoid losing all data.
+        For intraday predictions, also filters out predictions made outside market hours.
         """
         print("\nFiltering for viable predictions (before averaging)...")
         
@@ -126,10 +143,11 @@ class PredictionScreener:
         print(f"Current time: {current_et.strftime('%Y-%m-%d %H:%M:%S ET')} ({current_utc.strftime('%H:%M:%S UTC')})")
         print(f"Original predictions count: {original_count}")
         
-        # EOD predictions filtering with market hours consideration
+        # Convert news times to ET for market hours checking
+        self.predictions_df['news_et'] = self.predictions_df['news_datetime'].dt.tz_convert('US/Eastern')
+        
         if self.horizon == 'eod':
-            self.predictions_df['news_et'] = self.predictions_df['news_datetime'].dt.tz_convert('US/Eastern')
-            
+            # EOD predictions filtering with market hours consideration
             market_close_hour = 16
             
             # Initialize counters for detailed reporting
@@ -140,21 +158,8 @@ class PredictionScreener:
             
             viable_indices = []
             
-            # Add diagnostic counters
-            total_after_hours = 0
-            total_viable_after_hours = 0
-            sample_diagnostics = []
-            
             for idx, row in self.predictions_df.iterrows():
                 news_et = row['news_et']
-                
-                # Check if this is after-hours for diagnostics
-                is_after_hours = (news_et.weekday() >= 5 or  # Weekend
-                                news_et.hour >= 16 or        # After close
-                                news_et.hour < 9)            # Before open
-                
-                if is_after_hours:
-                    total_after_hours += 1
                 
                 # Use the shared logic to determine target close date
                 target_close_date = self.get_target_close_date(news_et)
@@ -169,8 +174,6 @@ class PredictionScreener:
                 
                 if is_viable:
                     viable_indices.append(idx)
-                    if is_after_hours:
-                        total_viable_after_hours += 1
                 else:
                     # If not viable, categorize why for reporting
                     if news_et.date() > current_et.date():
@@ -182,16 +185,6 @@ class PredictionScreener:
                         after_hours_count += 1
                     else:  # Must be during market hours but market hasn't closed yet
                         market_still_open_count += 1
-                
-                # Collect sample diagnostics for first 5 after-hours items
-                if is_after_hours and len(sample_diagnostics) < 5:
-                    sample_diagnostics.append({
-                        'ticker': row['ticker'],
-                        'news_et': news_et.strftime('%Y-%m-%d %H:%M ET'),
-                        'target_date': target_close_date.strftime('%Y-%m-%d'),
-                        'is_viable': is_viable,
-                        'why': 'viable' if is_viable else 'needs future data'
-                    })
             
             # Filter the dataframe using the viable indices
             viable_df = self.predictions_df.loc[viable_indices].copy()
@@ -211,13 +204,8 @@ class PredictionScreener:
             print(f"Keeping {len(viable_df)} viable predictions")
             
             self.predictions_df = viable_df
-            
-            if self.predictions_df.empty:
-                print("No viable predictions available for analysis.")
-                print("All predictions need future market data or market close.")
-                return False
         
-        # For intraday horizons, keep the existing time-based logic
+        # For intraday horizons, filter by time elapsed AND market hours
         elif self.horizon in ['1hr', '4hr']:
             time_delta = timedelta(hours=1) if self.horizon == '1hr' else timedelta(hours=4)
             current_time_utc = datetime.now(pytz.UTC)
@@ -225,19 +213,50 @@ class PredictionScreener:
             print(f"Current time (UTC): {current_time_utc}")
             print(f"Time delta for {self.horizon}: {time_delta}")
             
-            # Filter out predictions where the news time + horizon is in the future
-            viable_mask = self.predictions_df['news_datetime'] + time_delta < current_time_utc
-            viable_df = self.predictions_df[viable_mask].copy()
+            viable_indices = []
+            future_count = 0
+            non_market_hours_count = 0
+            
+            for idx, row in self.predictions_df.iterrows():
+                news_time = row['news_datetime']
+                news_et = row['news_et']
+                target_time = news_time + time_delta
+                
+                # Check if enough time has passed
+                time_elapsed = news_time + time_delta < current_time_utc
+                
+                # Check if news was during market hours
+                during_market_hours = self.is_market_hours(news_et)
+                
+                # Debug first few predictions
+                if idx < 5:
+                    print(f"DEBUG {row['ticker']}: {news_time} UTC -> {news_et} ET, market_hours={during_market_hours}, time_elapsed={time_elapsed}")
+                
+                if time_elapsed and during_market_hours:
+                    viable_indices.append(idx)
+                elif not time_elapsed:
+                    future_count += 1
+                elif not during_market_hours:
+                    non_market_hours_count += 1
+            
+            viable_df = self.predictions_df.loc[viable_indices].copy()
             
             filtered_count = original_count - len(viable_df)
-            print(f"Filtered out {filtered_count} predictions where the {self.horizon} horizon has not yet been reached.")
+            print(f"Filtered out {filtered_count} predictions:")
+            if future_count > 0:
+                print(f"  - {future_count} where the {self.horizon} horizon has not yet been reached")
+            if non_market_hours_count > 0:
+                print(f"  - {non_market_hours_count} from outside market hours (9:30 AM - 4:00 PM ET, weekdays)")
             
             self.predictions_df = viable_df
-            
-            if self.predictions_df.empty:
-                print("No viable predictions available for analysis.")
-                print(f"All predictions are too recent - need predictions older than {time_delta} to calculate {self.horizon} changes.")
-                return False
+        
+        if self.predictions_df.empty:
+            print("No viable predictions available for analysis.")
+            if self.horizon == 'eod':
+                print("All predictions need future market data or market close.")
+            else:
+                print(f"All predictions are either too recent, outside market hours, or both.")
+            return False
 
         print(f"Proceeding with {len(self.predictions_df)} viable predictions")
         return True
@@ -294,27 +313,36 @@ class PredictionScreener:
     def fetch_market_data(self):
         """
         Fetches the necessary market data from yfinance in batches for reliability.
+        For intraday horizons, uses appropriate interval (5m for better reliability than 1m).
         """
         tickers = self.predictions_df['ticker'].unique().tolist()
-        # Fetch from 1 day before the earliest news to handle EOD calculations correctly
+        # Fetch from 1 day before the earliest news to handle calculations correctly
         min_date = (self.predictions_df['news_datetime'].min() - timedelta(days=3)).date()
-        # Add a larger buffer to try to capture next trading day
+        # Add a buffer to capture data
         max_date = (self.predictions_df['news_datetime'].max() + timedelta(days=5)).date()
         
         print(f"Prediction date range: {self.predictions_df['news_datetime'].min()} to {self.predictions_df['news_datetime'].max()}")
         print(f"Fetching market data from {min_date} to {max_date}")
 
+        # Choose interval based on horizon - use 5m for intraday for better reliability
+        if self.horizon == 'eod':
+            interval = '1d'
+        elif self.horizon == '1hr':
+            interval = '5m'  # 5-minute data is more reliable than 1m
+        else:  # 4hr
+            interval = '15m'  # 15-minute data for 4hr horizon
+        
+        print(f"Using {interval} interval for {self.horizon} horizon")
         print(f"\nFetching market data for {len(tickers)} tickers from {min_date} to {max_date}...")
 
         # Split tickers into smaller batches to avoid yfinance issues
-        batch_size = 50  # Reduced batch size for better reliability
+        batch_size = 50
         ticker_batches = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
         
         for i, batch in enumerate(ticker_batches):
             print(f"Fetching batch {i+1}/{len(ticker_batches)} ({len(batch)} tickers)...")
             
             try:
-                interval = '1d' if self.horizon == 'eod' else '1m'
                 data = yf.download(batch, start=min_date, end=max_date, interval=interval, progress=False, group_by='ticker')
 
                 if data.empty:
@@ -324,7 +352,14 @@ class PredictionScreener:
                 # Process each ticker in the batch
                 for ticker in batch:
                     try:
-                        ticker_data = data[ticker] if len(batch) > 1 and ticker in data else data
+                        if len(batch) > 1:
+                            if ticker in data.columns.levels[0]:  # Check if ticker exists
+                                ticker_data = data[ticker]
+                            else:
+                                print(f"Warning: No data for {ticker}")
+                                continue
+                        else:
+                            ticker_data = data
                         
                         if not ticker_data.dropna().empty:
                             # Convert market data index to UTC for consistent comparison
@@ -334,7 +369,6 @@ class PredictionScreener:
                             self.market_data[ticker] = ticker_data
                     
                     except Exception as e:
-                        # This handles cases where a specific ticker in a batch fails
                         print(f"Warning: Failed to process {ticker}: {e}")
             
             except Exception as e:
@@ -345,7 +379,7 @@ class PredictionScreener:
     def calculate_actual_changes(self):
         """
         Calculates the actual price changes based on the specified horizon.
-        Now properly aligned with filtering logic for after-hours EOD predictions.
+        Uses appropriate logic for each time horizon.
         """
         print("\nCalculating actual price changes...")
         actual_changes = []
@@ -362,7 +396,7 @@ class PredictionScreener:
                 market_df = self.market_data[ticker]
                 
                 if self.horizon == 'eod':
-                    # --- FIXED EOD Calculation Logic ---
+                    # EOD Calculation Logic
                     try:
                         # Convert news time to ET for market hours logic
                         news_et = news_time.astimezone(pytz.timezone('US/Eastern'))
@@ -408,20 +442,38 @@ class PredictionScreener:
                         debug_msg = f"Exception: {e}"
 
                 else:
-                    # --- Intraday (1hr/4hr) Calculation (unchanged) ---
+                    # Intraday (1hr/4hr) Calculation
                     try:
                         time_delta = timedelta(hours=1) if self.horizon == '1hr' else timedelta(hours=4)
                         target_time = news_time + time_delta
                         
-                        start_price = market_df.asof(news_time)['Close']
-                        end_price = market_df.asof(target_time)['Close']
+                        # Use asof to find closest available prices
+                        start_data = market_df.asof(news_time)
+                        end_data = market_df.asof(target_time)
+                        
+                        # Fix the Series ambiguity issue
+                        start_price = None
+                        end_price = None
+                        
+                        if start_data is not None and not pd.isna(start_data).all():
+                            if hasattr(start_data, 'Close'):
+                                start_price = start_data['Close']
+                            elif isinstance(start_data, pd.Series) and 'Close' in start_data:
+                                start_price = start_data['Close']
+                        
+                        if end_data is not None and not pd.isna(end_data).all():
+                            if hasattr(end_data, 'Close'):
+                                end_price = end_data['Close']
+                            elif isinstance(end_data, pd.Series) and 'Close' in end_data:
+                                end_price = end_data['Close']
 
-                        if pd.notna(start_price) and pd.notna(end_price) and start_price != 0:
+                        if (start_price is not None and end_price is not None and 
+                            pd.notna(start_price) and pd.notna(end_price) and start_price != 0):
                             change = (end_price - start_price) / start_price * 100
                             successful_calcs += 1
-                            debug_msg = f"SUCCESS: {change:.2f}%"
+                            debug_msg = f"SUCCESS: {change:.4f}%"
                         else:
-                            debug_msg = "FAILED: missing prices"
+                            debug_msg = f"FAILED: start_price={start_price}, end_price={end_price}"
                     except Exception as e:
                         debug_msg = f"Exception: {e}"
             else:
@@ -437,7 +489,7 @@ class PredictionScreener:
         
         self.results_df = self.predictions_df.dropna(subset=[self.actual_col])
         
-        # Show how many predictions were dropped for missing future market data
+        # Show how many predictions were dropped for missing market data
         dropped_count = len(self.predictions_df) - len(self.results_df)
         if dropped_count > 0:
             print(f"Dropped {dropped_count} predictions due to missing market data")
@@ -450,13 +502,26 @@ class PredictionScreener:
                 for _, row in sample_failed.iterrows():
                     print(f"  {row['ticker']} {row['news_datetime']}: {row['debug_info']}")
         
-        # Filter out 0% actual changes for intraday horizons (after-hours/no movement)
+        # Modified filtering: Only filter out 0% changes if they seem like data issues
         if self.horizon in ['1hr', '4hr']:
             initial_count = len(self.results_df)
-            self.results_df = self.results_df[self.results_df[self.actual_col] != 0]
-            filtered_count = len(self.results_df)
-            if initial_count != filtered_count:
-                print(f"Filtered out {initial_count - filtered_count} predictions with 0% actual change (after-hours/no movement)")
+            
+            if initial_count > 0:  # Avoid division by zero
+                # Count how many have exactly 0% change
+                zero_changes = (self.results_df[self.actual_col] == 0).sum()
+                print(f"Found {zero_changes} predictions with exactly 0% change")
+                
+                # Only filter if more than 50% are exactly 0% (suggests data issue)
+                # Otherwise, keep them as legitimate small movements
+                if zero_changes / initial_count > 0.5:
+                    print(f"Filtering out 0% changes (likely data quality issue)")
+                    self.results_df = self.results_df[self.results_df[self.actual_col] != 0]
+                    filtered_count = len(self.results_df)
+                    print(f"Filtered from {initial_count} to {filtered_count} predictions")
+                else:
+                    print(f"Keeping 0% changes as legitimate market data")
+            else:
+                print("No results to analyze for 0% changes")
         
         print(f"Successfully calculated actuals for {len(self.results_df)} predictions.")
         
@@ -475,7 +540,7 @@ class PredictionScreener:
             return
 
         if self.results_df.empty:
-            print("No active market predictions found to report on.")
+            print("No predictions found to report on.")
             return
 
         # Determine if the predicted direction was correct (handle zero predictions/actuals)
@@ -511,12 +576,24 @@ class PredictionScreener:
         
         # Magnitude accuracy metrics
         print(f"\nMAGNITUDE ACCURACY:")
-        print(f"Mean Absolute Error (MAE): {mae:.2f} percentage points")
+        print(f"Mean Absolute Error (MAE): {mae:.4f} percentage points")
         if not np.isnan(mape):
             print(f"Mean Absolute Percentage Error (MAPE): {mape:.1f}%")
         print(f"Predictions within ±1%: {within_1pct:.1f}%")
         print(f"Predictions within ±2%: {within_2pct:.1f}%")
         print(f"Predictions within ±5%: {within_5pct:.1f}%")
+        
+        # Show statistics about actual changes
+        actual_stats = self.results_df[self.actual_col].describe()
+        print(f"\nACTUAL CHANGE DISTRIBUTION:")
+        print(f"Mean: {actual_stats['mean']:.4f}%")
+        print(f"Std: {actual_stats['std']:.4f}%")
+        print(f"Range: {actual_stats['min']:.4f}% to {actual_stats['max']:.4f}%")
+        
+        # Count exactly 0% changes
+        zero_count = (self.results_df[self.actual_col] == 0).sum()
+        if zero_count > 0:
+            print(f"Predictions with exactly 0% actual change: {zero_count} ({zero_count/len(self.results_df)*100:.1f}%)")
         
         # Show article count statistics (only meaningful for EOD)
         if 'article_count' in self.results_df.columns and self.horizon == 'eod':
@@ -532,35 +609,29 @@ class PredictionScreener:
         # Display a sample of the results with magnitude info
         report_cols = ['ticker', 'news_datetime', self.prediction_col, self.actual_col, 'direction_correct', 'abs_error']
         if 'article_count' in self.results_df.columns:
-            report_cols.insert(-2, 'article_count')  # Insert before direction_correct and abs_error
+            report_cols.insert(-2, 'article_count')
             
         display_df = self.results_df[report_cols].copy()
         display_df['news_datetime'] = display_df['news_datetime'].dt.strftime('%Y-%m-%d %H:%M')
-        display_df[self.prediction_col] = display_df[self.prediction_col].map('{:,.2f}%'.format)
-        display_df[self.actual_col] = display_df[self.actual_col].map('{:,.2f}%'.format)
-        display_df['abs_error'] = display_df['abs_error'].map('{:.2f}pp'.format)  # pp = percentage points
+        display_df[self.prediction_col] = display_df[self.prediction_col].map('{:,.4f}%'.format)
+        display_df[self.actual_col] = display_df[self.actual_col].map('{:,.4f}%'.format)
+        display_df['abs_error'] = display_df['abs_error'].map('{:.4f}pp'.format)
         display_df['direction_correct'] = display_df['direction_correct'].map({True: '✅ Yes', False: '❌ No'})
         
         print("Sample of Results:")
         print(display_df.head(20).to_string(index=False))
 
-        # --- Detailed Statistics ---
+        # Detailed Statistics
         print(f"\n{'-'*50}")
         print("DETAILED STATISTICS")
         print(f"{'-'*50}")
         
         pred_stats = self.results_df[self.prediction_col].describe()
-        actual_stats = self.results_df[self.actual_col].describe()
         
         print(f"\nPrediction Statistics:")
-        print(f"  Mean:  {pred_stats['mean']:.2f}%")
-        print(f"  Std:   {pred_stats['std']:.2f}%")
-        print(f"  Range: {pred_stats['min']:.2f}% to {pred_stats['max']:.2f}%")
-        
-        print(f"\nActual Statistics:")
-        print(f"  Mean:  {actual_stats['mean']:.2f}%")
-        print(f"  Std:   {actual_stats['std']:.2f}%")
-        print(f"  Range: {actual_stats['min']:.2f}% to {actual_stats['max']:.2f}%")
+        print(f"  Mean:  {pred_stats['mean']:.4f}%")
+        print(f"  Std:   {pred_stats['std']:.4f}%")
+        print(f"  Range: {pred_stats['min']:.4f}% to {pred_stats['max']:.4f}%")
 
     def export_results(self):
         """
@@ -606,7 +677,7 @@ class PredictionScreener:
         Executes the full screener pipeline with corrected order.
         """
         if self.load_predictions():
-            # CRITICAL FIX: Filter out predictions that can't be calculated BEFORE averaging
+            # Filter out predictions that can't be calculated BEFORE averaging
             if not self.filter_viable_predictions():
                 return
                 
