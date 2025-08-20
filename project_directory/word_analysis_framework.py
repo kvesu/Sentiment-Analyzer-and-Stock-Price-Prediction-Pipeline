@@ -45,7 +45,7 @@ class DynamicSentimentLearner:
     specifically financial news articles, and their correlation with
     stock price movements.
     """
-    def __init__(self, min_word_frequency: int = 3, min_bigram_frequency: int = 2, max_features: int = 1000):
+    def __init__(self, min_word_frequency: int = 3, min_bigram_frequency: int = 2, max_features: int = 150):
         self.logger = logging.getLogger(__name__)
         self.model = None
         self.vectorizer = None
