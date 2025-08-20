@@ -16,11 +16,11 @@ class FinancialNewsFeatureEngineer:
     def __init__(self, datetime_col: str = 'datetime', group_col: str = 'ticker', live_mode: bool = False):
         self.datetime_col = datetime_col
         self.group_col = group_col
-        self.eastern_tz = pytz.timezone('US/Eastern')
+        self.eastern_tz = pytz.timezone('US/Eastern') # Timezone used for market and article datetimes
         self.live_mode = live_mode
-        self.feature_columns = []
-        self.price_cache = {}
-        self.market_cache = None
+        self.feature_columns = [] # List to keep track of generated feature columns
+        self.price_cache = {} # In-memory cache for ticker price data
+        self.market_cache = None # Market-wide context data (e.g., SPY, VIX)
 
     def _fetch_and_cache_data(self, df: pd.DataFrame):
         """Fetches and caches all required historical price and market data using persistent files."""
@@ -32,7 +32,8 @@ class FinancialNewsFeatureEngineer:
         tickers = df[self.group_col].unique().tolist()
         if not tickers:
             return
-            
+        
+        # Define date range with lookback buffer (1 year before earliest article date)
         min_date = df[self.datetime_col].min().date() - timedelta(days=365)
         max_date = df[self.datetime_col].max().date() + timedelta(days=1)
         
