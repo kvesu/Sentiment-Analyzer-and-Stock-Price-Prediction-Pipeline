@@ -144,22 +144,24 @@ python main.py
 **Dependencies**: Requires `feature_engineering.py` and `word_analysis_framework.py` in same directory  
 **Output**: 
 - `cleaned_engineered_features.csv`
-- `classified_features_eod.csv` (and similar for other horizons)
+- `scraped_articles.csv`
 - `articles.db` (SQLite database)
 
 #### 3. Train Gatekeeper Classifier
 ```bash
 python train_classifier.py [horizon]
 ```
-**Purpose**: Trains model to identify news correlated with significant price moves  
+**Purpose**: Trains model to identify news correlated with significant price moves 
 **Options**: Replace `[horizon]` with `eod`, `1hr`, or `4hr` (defaults to `eod` if not specified)  
-**Output**: `models/stock_move_classifier_[horizon].pkl`
+**Output**: 
+- `models/stock_move_classifier_[horizon].pkl`
+- `classified_features_[horizon].csv`
 
 #### 4. Train Price Regression Model
 ```bash
 python train_regressor.py [horizon]
 ```
-**Purpose**: Trains regression model for actual price change prediction  
+**Purpose**: Trains regression model for actual price change prediction 
 **Options**: Replace `[horizon]` with `eod`, `1hr`, or `4hr` (defaults to `eod` if not specified)  
 **Output**: `models/stock_price_regressor_[horizon].pkl`
 
