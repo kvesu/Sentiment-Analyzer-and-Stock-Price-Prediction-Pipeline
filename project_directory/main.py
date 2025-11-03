@@ -351,7 +351,7 @@ class NewsProcessor:
             return set()
     
     def _setup_nltk(self):
-        for name in ['stopwords', 'punkt', 'wordnet']:
+        for name in ['stopwords', 'punkt', 'wordnet', 'punkt_tab']:
             try:
                 if name == 'punkt':
                     nltk.data.find('tokenizers/punkt')
