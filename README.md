@@ -37,7 +37,7 @@ source stock_prediction_env/bin/activate  # Linux/Mac
 pip install numpy>=1.24.3
 
 # Then install other dependencies
-pip install -r requirements.txt
+pip install -r .\requirements.txt
 ```
 
 ## Installation
