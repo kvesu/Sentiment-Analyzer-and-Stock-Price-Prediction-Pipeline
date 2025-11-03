@@ -29,7 +29,7 @@ An advanced machine learning pipeline that automatically scrapes financial news,
 ### Environment Setup
 ```bash
 # Create virtual environment with Python 3.12 or lower
-python3.12 -m venv stock_prediction_env
+python -m venv stock_prediction_env
 source stock_prediction_env/bin/activate  # Linux/Mac
 # stock_prediction_env\Scripts\activate  # Windows
 
