@@ -52,7 +52,7 @@ Follow the [Critical Environment Requirements](#critical-environment-requirement
 
 ### 3. Install Dependencies
 ```bash
-pip install -r requirements.txt
+pip install -r .\requirements.txt
 ```
 
 ### 4. Required File Structure
