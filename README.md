@@ -19,11 +19,11 @@ An advanced machine learning pipeline that automatically scrapes financial news,
 **Before installation, ensure your environment meets these exact version requirements:**
 
 ### Python Version
-- **Required**: Python 3.12.X or lower (3.11.X or 3.10.X also supported)
+- **Required**: Python 3.12.X
 - **Not supported**: Python 3.13+ (incompatible with pandas-ta, yfinance, and other ML libraries)
 
 ### NumPy Version
-- **Required**: NumPy 1.24.3 exactly
+- **Required**: numpy>=1.24.3
 - **Critical**: Newer NumPy versions (1.25+) cause breaking import errors with pandas-ta, yfinance, and pandas dependencies
 
 ### Environment Setup
@@ -34,7 +34,7 @@ source stock_prediction_env/bin/activate  # Linux/Mac
 # stock_prediction_env\Scripts\activate  # Windows
 
 # Install NumPy 1.24.3 FIRST
-pip install numpy==1.24.3
+pip install numpy>=1.24.3
 
 # Then install other dependencies
 pip install -r requirements.txt
